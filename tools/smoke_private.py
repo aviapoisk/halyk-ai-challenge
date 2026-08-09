@@ -19,6 +19,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from agent.txn_ids import parse_txn_scenario
+
 # Expected open-set baseline columns (informational WARN baseline, not agent hardcoding).
 _EXPECTED_COLS = (
     "txn_id",
@@ -31,7 +33,7 @@ _EXPECTED_COLS = (
 )
 _REQUIRED_COLS = {"txn_id", "account_id", "amount"}
 _TOP_LEVEL_KEYS = {"team", "contact_email", "model", "answers"}
-_TXN_RE = re.compile(r"^TXN-(?P<scenario>.+)-(?P<seq>\d+)$")
+_TXN_RE = re.compile(r"^TXN-(?P<rest>.+)-(?P<seq>\d+)$")
 _ACC_RE = re.compile(r"^ACC-(?P<digits>\d+)$")
 _CLAUSE_RE = re.compile(r"^\d+\.\d+$")
 _LATIN_WORD = re.compile(r"[A-Za-z]{3,}")
@@ -222,7 +224,7 @@ def check_ids(bag: CheckBag, rows: list[dict[str, str]]) -> None:
         m_txn = _TXN_RE.match(txn)
         if m_txn:
             txn_ok += 1
-            scenarios.add(m_txn.group("scenario"))
+            scenarios.add(m_txn.group("rest"))
         elif len(bad_txn) < 5:
             bad_txn.append(txn or "(empty)")
 
@@ -336,6 +338,65 @@ def check_template(bag: CheckBag, template_path: Path) -> None:
 
     for r in bag.results:
         if r.code.startswith("template."):
+            print(r)
+    print()
+
+
+def check_template_ledger_align(
+    bag: CheckBag, rows: list[dict[str, str]], template_path: Path
+) -> None:
+    """FAIL if a template scenario has zero ledger rows after txn→sid resolve."""
+    print("=== 3b. template ↔ ledger (resolved) ===")
+    try:
+        data = json.loads(template_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        bag.fail("align.template_parse", f"cannot parse {template_path}: {exc}")
+        for r in bag.results:
+            if r.code.startswith("align."):
+                print(r)
+        print()
+        return
+
+    answers = data.get("answers") if isinstance(data, dict) else None
+    if not isinstance(answers, dict) or not answers:
+        bag.fail("align.answers", "answers missing or empty — cannot align")
+        for r in bag.results:
+            if r.code.startswith("align."):
+                print(r)
+        print()
+        return
+
+    known = set(answers.keys())
+    rows_by_sid: Counter[str] = Counter()
+    accounts_by_sid: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in rows:
+        sid = parse_txn_scenario(row.get("txn_id", ""), known)
+        if sid is None or sid not in known:
+            continue
+        rows_by_sid[sid] += 1
+        acc = (row.get("account_id") or "").strip() or "(empty)"
+        accounts_by_sid[sid][acc] += 1
+
+    missing = sorted(known - set(rows_by_sid))
+    if missing:
+        bag.fail(
+            "align.missing_ledger",
+            f"template scenarios with 0 ledger rows after resolve: {missing}",
+        )
+    else:
+        bag.pass_(
+            "align.coverage",
+            f"all {len(known)} template scenarios have ≥1 ledger row after resolve",
+        )
+
+    for sid in sorted(known):
+        bag.info(
+            "align.sid_accounts",
+            f"{sid}: rows={rows_by_sid.get(sid, 0)} accounts={dict(accounts_by_sid.get(sid, {}))}",
+        )
+
+    for r in bag.results:
+        if r.code.startswith("align."):
             print(r)
     print()
 
@@ -601,6 +662,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = check_ledger(bag, args.dataset, paths.ledger)
     check_ids(bag, rows)
     check_template(bag, paths.template)
+    check_template_ledger_align(bag, rows, paths.template)
     headers = check_documents(bag, paths.documents)
     check_languages(bag, headers)
     check_fx(bag, rows)

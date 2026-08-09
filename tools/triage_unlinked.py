@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -38,7 +39,9 @@ def main(argv: list[str] | None = None) -> int:
     for f in failures:
         print(f"FAIL ingest {f}")
     docs_by_id = {d.doc_id: d for d in docs}
-    account_to_scenario, map_warnings = load_account_to_scenario(paths.ledger)
+    template = json.loads(paths.template.read_text(encoding="utf-8"))
+    known = set((template.get("answers") or {}).keys())
+    account_to_scenario, map_warnings = load_account_to_scenario(paths.ledger, known)
     for w in map_warnings:
         print(f"WARN {w}")
     linkages = link_documents(docs, account_to_scenario)

@@ -63,7 +63,8 @@ def write_submission_atomic(
     submission: dict, template: dict, ledger_path: Path, out_path: Path
 ) -> tuple[ValidationResult, list[str]]:
     """Sanitize, validate, always write. Returns (validation, sanitize_fixes)."""
-    ledger_index = load_ledger_index(ledger_path)
+    known = set((template.get("answers") or {}).keys())
+    ledger_index = load_ledger_index(ledger_path, known)
     fixes = sanitize_answers(submission, template, ledger_index)
     result = validate(submission, template, ledger_index)
 

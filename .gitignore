@@ -74,10 +74,10 @@ overrides.yaml
 *.override.yaml
 
 # Private battle-day dataset drop (open sample is under data/agentic-bank-public/)
-private/
-data/private/
-data/agentic-bank-private/
-docs/agentic-bank-private/
+# private/
+# data/private/
+# data/agentic-bank-private/
+# docs/agentic-bank-private/
 
 # --- tooling / generated ---
 graphify-out/

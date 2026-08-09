@@ -25,8 +25,8 @@ from agent.normalize import (
 )
 from agent.s1_ingest import ingest_directory
 from agent.schemas import DocumentLinkage, IngestedDocument
+from agent.txn_ids import parse_txn_scenario
 
-_TXN_RE = re.compile(r"^TXN-(?P<scenario>.+)-(?P<seq>\d+)$")
 # Legacy open-set form — kept so unknown ACC-NNNN still surfaces as anchor_unknown_account
 # when the ledger pattern (private-set ids) does not match the token.
 _LEGACY_ACC = re.compile(r"A\s*C\s*C\s*-\s*(\d\s*){3,6}")
@@ -40,16 +40,22 @@ def _legacy_acc_anchors(text: str) -> list[str]:
     return out
 
 
-def load_account_to_scenario(ledger_path: Path) -> tuple[dict[str, str], list[str]]:
-    """account_id -> scenario_id from the ledger. Collisions → majority vote + warning."""
+def load_account_to_scenario(
+    ledger_path: Path,
+    known_scenarios: set[str] | frozenset[str] | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """account_id -> scenario_id from the ledger. Collisions → majority vote + warning.
+
+    Pass ``known_scenarios`` from ``submission_template.json`` answers keys so
+    multi-segment txn ids (TXN-KC-CAP-29) resolve to the template key (KC).
+    """
     votes: dict[str, Counter[str]] = {}
     with open(ledger_path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            m = _TXN_RE.match(row.get("txn_id", ""))
             account_id = row.get("account_id", "")
-            if not m or not account_id:
+            scenario = parse_txn_scenario(row.get("txn_id", ""), known_scenarios)
+            if not scenario or not account_id:
                 continue
-            scenario = m.group("scenario")
             votes.setdefault(account_id, Counter())[scenario] += 1
 
     mapping: dict[str, str] = {}
@@ -161,9 +167,13 @@ def _main() -> int:
     p.add_argument("--cache", type=Path, default=Path(".cache"))
     args = p.parse_args()
 
+    import json
+
     paths = discover_dataset(args.dataset)
     docs, failures = ingest_directory(paths.documents, cache_dir=args.cache)
-    account_to_scenario, map_warnings = load_account_to_scenario(paths.ledger)
+    template = json.loads(paths.template.read_text(encoding="utf-8"))
+    known = set((template.get("answers") or {}).keys())
+    account_to_scenario, map_warnings = load_account_to_scenario(paths.ledger, known)
     for w in map_warnings:
         print(f"WARN {w}")
     for f in failures:

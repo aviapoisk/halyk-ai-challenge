@@ -10,8 +10,6 @@
 
 <p><img src="./assets/agent-run.jpg" alt="Прогон агента" width="100%" /></p>
 
-*TUI прогона: этапы S1–S6, таймеры стадий, счётчик токенов LLM, операторские алерты.*
-
 ## Запуск за две минуты
 
 Нужны [uv](https://docs.astral.sh/uv/) и Python 3.12 (закреплён в `.python-version`).
@@ -30,11 +28,11 @@ cp .env.example .env
 `AGENT_BASE_URL` для локального endpoint).
 
 ```bash
-R=runs/priv1
+R=results/submission1
 uv run python -m agent.run \
-  --dataset data/agentic-bank-private \
+  --dataset data/agentic-bank-hidden \
   --out $R/submission.json \
-  --cache .cache/private \
+  --cache .cache/submission1 \
   --engine tree \
   --dev
 ```

@@ -1965,7 +1965,10 @@ async def run(config, sink: ProgressSink) -> dict:
 
         docs_by_id = {d.doc_id: d for d in all_docs}
         sink.stage_start("S2_link", "account ↔ scenario + document binding")
-        account_to_scenario, account_map_warnings = load_account_to_scenario(paths.ledger)
+        known_scenarios = set(scenario_ids)
+        account_to_scenario, account_map_warnings = load_account_to_scenario(
+            paths.ledger, known_scenarios
+        )
         for w in account_map_warnings:
             sink.log(f"[S2] {w}")
             journal.append(w)
@@ -2314,8 +2317,15 @@ def main(argv: list[str] | None = None) -> int:
         # Last-resort: if we somehow escape run() without a file, surface the error.
         # Per-scenario failures are already recovered inside run().
         raise
-    if not outcome["validation"].ok:
-        for v in outcome["validation"].violations:
+    validation = outcome.get("validation")
+    if validation is None:
+        # Emergency dump path: file may exist but we have no ValidationResult.
+        sink.finish(
+            f"emergency dump written to {config.out_path} (no validation result)"
+        )
+        return 1
+    if not validation.ok:
+        for v in validation.violations:
             sink.log(f"FAIL {v}")
             print(f"FAIL {v}")
         sink.finish("validation failed")

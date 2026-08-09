@@ -76,7 +76,7 @@ Carve-outs: if the SAME clause text carves out items from the metric («за и�
 # carve_outs=[{kind:"counterparty", value:"Acme LLP", amount:null, quote:"за исключением платежей контрагенту Acme LLP"}].
 
 is_superseded must be true if the document itself states it was replaced, superseded, or is a non-current redline of the agreement.
-If account_id (ACC-NNNN) is not stated in the document, return null — do not guess.
+If the ledger account id is not stated in the document, return null — do not guess (do not invent ACC-/TELE- style ids).
 
 """ + _FX_EXTRACT_BLOCK
 
@@ -88,7 +88,7 @@ Extract the ownership threshold percentage that the dossier states defines a "re
 Extract the full list of disclosed counterparties with their voting-rights percentage — include every one listed, not just the ones above the threshold (S4 applies the threshold, not you).
 Do NOT limit the list to the ownership / voting-rights table. Rows from the collateral / security-coverage table («обеспечительное покрытие», «доля активов в залоге») are separate counterparties even when voting rights are not stated — set voting_rights_pct=0 and fill pledged_assets_pct for each named subsidiary. If a named party appears in both tables, keep one entry and fill both fields. If pledged % is not disclosed, leave pledged_assets_pct null.
 If the dossier states a rule like «ниже X% — Неограниченные / Unrestricted», set unrestricted_pledge_threshold_pct to that X; otherwise null.
-If account_id (ACC-NNNN) is not stated, return null — do not guess.
+If the ledger account id is not stated, return null — do not guess (do not invent ACC-/TELE- style ids).
 """
 
 _AUDITOR_SYSTEM = """\

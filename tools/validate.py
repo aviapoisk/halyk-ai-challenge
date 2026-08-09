@@ -13,16 +13,15 @@ import argparse
 import csv
 import json
 import math
-import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent.txn_ids import parse_txn_scenario
+
 TOP_LEVEL_KEYS = {"team", "contact_email", "model", "answers"}
 CELL_KEYS = {"status", "actual", "evidence_txn_id"}
 VALID_STATUSES = {"COMPLIANT", "BREACH"}
-
-_TXN_RE = re.compile(r"^TXN-(?P<scenario>.+)-(?P<seq>\d+)$")
 
 
 @dataclass
@@ -58,20 +57,23 @@ def load_json(path: Path) -> dict:
         return json.load(f)
 
 
-def load_ledger_index(ledger_path: Path) -> dict[str, set[str]]:
+def load_ledger_index(
+    ledger_path: Path,
+    known_scenarios: set[str] | frozenset[str] | None = None,
+) -> dict[str, set[str]]:
     """scenario_id -> set of txn_id belonging to it, derived from the txn_id prefix.
 
-    Never hardcode scenario ids: they are read from the ledger at runtime.
+    Pass ``known_scenarios`` from the submission template so multi-segment txn
+    ids resolve to template keys (e.g. TXN-KC-CAP-29 → KC).
     """
     index: dict[str, set[str]] = {}
     with open(ledger_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             txn_id = row.get("txn_id", "")
-            m = _TXN_RE.match(txn_id)
-            if not m:
+            scenario = parse_txn_scenario(txn_id, known_scenarios)
+            if not scenario:
                 continue
-            scenario = m.group("scenario")
             index.setdefault(scenario, set()).add(txn_id)
     return index
 
@@ -205,7 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     paths = discover_dataset(args.dataset)
     submission = load_json(args.submission)
     template = load_json(paths.template)
-    ledger_index = load_ledger_index(paths.ledger)
+    known = set((template.get("answers") or {}).keys())
+    ledger_index = load_ledger_index(paths.ledger, known)
 
     result = validate(submission, template, ledger_index)
 

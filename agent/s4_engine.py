@@ -31,6 +31,7 @@ from agent.schemas import (
     RelatedParty,
     TransactionCategoryBatch,
 )
+from agent.txn_ids import TXN_ID_IN_TEXT
 
 # Categories that must not appear alone as formula buckets (D4).
 _GARBAGE_SPEC_CATEGORIES = frozenset({"other"})
@@ -1028,7 +1029,7 @@ def recategorize_filled_amount_rows(
 
 
 _TXN_AMOUNT_IN_NOTE = re.compile(
-    r"(TXN-[A-Z0-9]+-\d+).*?\$\s*([\d]{1,3}(?:[\s,]\d{3})*(?:\.\d+)?|\d+\.\d+)",
+    rf"({TXN_ID_IN_TEXT.pattern}).*?\$\s*([\d]{{1,3}}(?:[\s,]\d{{3}})*(?:\.\d+)?|\d+\.\d+)",
     re.IGNORECASE | re.DOTALL,
 )
 # Window ≤120 chars after the label so a broken opener cannot steal a later $-amount (no DOTALL).
@@ -1039,7 +1040,7 @@ _SEVERANCE_IN_NOTE = re.compile(
 )
 
 
-_TXN_ID_IN_NOTE = re.compile(r"TXN-[A-Z0-9]+-\d+", re.IGNORECASE)
+_TXN_ID_IN_NOTE = TXN_ID_IN_TEXT
 
 
 def extract_txn_ids_from_notes(notes: list[str]) -> list[str]:

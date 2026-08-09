@@ -166,7 +166,7 @@ class LoanAgreementFacts(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     borrower_name: str
-    account_id: str | None  # "ACC-NNNN", or null when the agreement has no ACC anchor
+    account_id: str | None  # ledger account id as written (e.g. ACC-… / TELE-…), or null if absent
     contract_date: str  # YYYY-MM-DD, the agreement's own dated preamble
     effective_from: str  # YYYY-MM-DD, covenant-period start per the preamble
     effective_to: str  # YYYY-MM-DD, covenant-period end per the preamble
@@ -193,7 +193,7 @@ class KYCFacts(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     borrower_name: str
-    account_id: str | None  # null when the dossier has no ACC anchor (noise / counterparty file)
+    account_id: str | None  # ledger account id as written, or null when dossier has no account anchor
     related_party_threshold_pct: float | None  # ">= X%" rule; null if the dossier does not state one
     counterparties: list[RelatedParty]  # all disclosed, not just the ones over threshold
     # Below this pledge % the dossier treats the sub as Unrestricted («Неограниченн»). Null = not stated.
