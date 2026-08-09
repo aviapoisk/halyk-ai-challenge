@@ -42,7 +42,7 @@ class TestFlipTest:
         assert diag == []
         assert detail["flippers"] == ["b"]
 
-    def test_empty_mechanism_pool_rejects_contribution_singleton(self):
+    def test_empty_mechanism_pool_accepts_contribution_singleton(self):
         df = make_ledger(["a", "b", "c"])
         cats = {t: "revenue" for t in ["a", "b", "c"]}
 
@@ -52,9 +52,28 @@ class TestFlipTest:
         evidence, diag, detail = flip_test(
             df, ["a", "b", "c"], cats, recompute, current_status="BREACH"
         )
-        assert evidence is None
+        assert evidence == "b"
         assert detail["flippers"] == ["b"]
         assert "empty mechanism pool" in (detail.get("note") or "")
+
+    def test_nonempty_mechanism_pool_rejects_outsider_singleton(self):
+        df = make_ledger(["a", "b", "c"])
+        cats = {t: "revenue" for t in ["a", "b", "c"]}
+
+        def recompute(subset, categories):
+            return "COMPLIANT" if "b" not in set(subset["txn_id"]) else "BREACH"
+
+        evidence, diag, detail = flip_test(
+            df,
+            ["a", "b", "c"],
+            cats,
+            recompute,
+            current_status="BREACH",
+            mechanism_txn_ids=["a"],
+        )
+        assert evidence is None
+        assert detail["flippers"] == ["b"]
+        assert "outside mechanism pool" in (detail.get("note") or "")
 
     def test_zero_flippers_returns_none_with_diagnostic(self):
         df = make_ledger(["a", "b"])

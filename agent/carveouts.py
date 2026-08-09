@@ -82,6 +82,17 @@ def _row_matches(co: CarveOut, row: pd.Series, categories: dict[str, str]) -> bo
             # Restricted subsidiary transfers: match «ограниченн» / restricted in text.
             if "restricted" in needle or "ограниченн" in needle:
                 return "ограниченн" in desc or "restricted" in desc or "ограниченн" in cp
+            # Consulting / marketing baskets stated as free-text category labels.
+            if any(t in needle for t in ("consult", "консультац", "advisory")):
+                return any(
+                    t in desc or t in cp
+                    for t in ("consult", "advisory", "консультац", "советник")
+                )
+            if any(t in needle for t in ("market", "маркетинг", "реклам", "advertis")):
+                return any(
+                    t in desc or t in cp
+                    for t in ("marketing", "advertis", "маркетинг", "реклам")
+                )
             return needle in desc or needle in cp
         return categories.get(tid) == want
     if co.kind == "counterparty":

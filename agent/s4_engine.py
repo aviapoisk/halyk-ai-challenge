@@ -256,7 +256,14 @@ _TO_CATEGORY_FROM_QUOTE: list[tuple[re.Pattern, str]] = [
     (re.compile(_AS_CAT + r"(?:коммунальн|utilities|electricity)", re.I), "utilities"),
     (re.compile(_AS_CAT + r"(?:страхов|insurance)", re.I), "insurance"),
     (re.compile(_AS_CAT + r"(?:капитальн|capex)", re.I), "capex"),
+    # No CategoryName for marketing — map to other + description tag in apply_reclassifications.
+    (re.compile(_AS_CAT + r"(?:маркетинг\w*|marketing|реклам\w*)", re.I), "other"),
 ]
+
+_MARKETING_RECLASS_RE = re.compile(
+    r"(?:переклассифицир|reclassif).{0,80}(?:маркетинг|marketing|реклам)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def infer_to_category_from_quote(quote: str | None) -> str | None:
@@ -274,6 +281,11 @@ def infer_to_category_from_quote(quote: str | None) -> str | None:
         if pat.search(q):
             return cat
     return None
+
+
+def is_marketing_reclass_quote(quote: str | None) -> bool:
+    """True when auditor prose reclassifies into the marketing expense article."""
+    return bool(quote and _MARKETING_RECLASS_RE.search(quote))
 
 
 def _coerce_to_category(rec: Reclassification, desc: str = "") -> str | None:
@@ -364,12 +376,22 @@ def apply_reclassifications(
                 if not rows.empty:
                     desc = str(rows.iloc[0]["description"])
             to_cat = _coerce_to_category(rec, desc)
+            marketing_tag = is_marketing_reclass_quote(rec.quote)
+            if to_cat is None and marketing_tag:
+                to_cat = "other"
             if to_cat is None:
                 flags.append(f"reclassify missing to_category: {rec.quote[:120]}")
                 unmatched_indices.append(i)
                 continue
             for txn_id in matched_tids:
                 cats[txn_id] = to_cat
+            if marketing_tag and "description" in out.columns:
+                # Description-bucket marketing covenants sum by needles, not CategoryName.
+                for idx in idxs:
+                    cur = str(out.at[idx, "description"] or "")
+                    if "marketing" not in cur.casefold():
+                        out.at[idx, "description"] = f"{cur} marketing reclass".strip()
+                flags.append(f"marketing reclass tagged n={len(matched_tids)}")
             applied_keys.extend(matched_tids or [rec.txn_id or f"idx:{i}"])
     if applied_keys:
         flags.append(f"applied {len(set(applied_keys))} reclassifications")
@@ -605,8 +627,36 @@ def _normalize_counterparty(name: str) -> str:
     return normalize_company_name(re.sub(r"\s*\([^)]*\)\s*$", "", name).rstrip("."))
 
 
-def _related_party_names(parties: list[RelatedParty], threshold_pct: float) -> set[str]:
-    return {_normalize_counterparty(p.counterparty_name) for p in parties if p.voting_rights_pct >= threshold_pct}
+_AFFILIATE_QUOTE_MARKERS = (
+    "аффилирован",
+    "связанн",
+    "related",
+    "ias 24",
+    "дочерн",
+    "affiliate",
+    "subsidiary",
+    "wholly owned",
+)
+
+
+def _party_explicitly_related(party: RelatedParty) -> bool:
+    """True when KYC quote marks the counterparty as affiliated/related (no ownership threshold)."""
+    q = (party.quote or "").casefold()
+    return any(m in q for m in _AFFILIATE_QUOTE_MARKERS)
+
+
+def _related_party_names(parties: list[RelatedParty], threshold_pct: float | None) -> set[str]:
+    if threshold_pct is None:
+        return {
+            _normalize_counterparty(p.counterparty_name)
+            for p in parties
+            if _party_explicitly_related(p)
+        }
+    return {
+        _normalize_counterparty(p.counterparty_name)
+        for p in parties
+        if p.voting_rights_pct >= float(threshold_pct)
+    }
 
 
 def related_party_match_mask(
@@ -955,6 +1005,12 @@ def fill_missing_amounts_from_reclassifications(
         desc = str(out.at[idx, "description"]).casefold() if "description" in out.columns else ""
         quote = (rec.quote or "").casefold()
         to_cat = rec.to_category
+        # Explicit inflow language in the note wins over description expense tokens
+        # (e.g. «sales settlement» + «поступление»).
+        inflow_note = any(
+            tok in quote
+            for tok in ("поступлен", "inflow", "inflowing", "выручк", "revenue", "приход")
+        )
         expense_cat = to_cat in {
             "operating_expense",
             "payroll",
@@ -965,7 +1021,7 @@ def fill_missing_amounts_from_reclassifications(
             "interest_expense",
             "capex",
         }
-        if (
+        if not inflow_note and (
             expense_cat
             or any(tok in desc for tok in expense_toks)
             or any(tok in quote for tok in ("расход", "expense", "налог", "tax", "коммуналь"))
@@ -1205,6 +1261,179 @@ def category_summary(period_df: pd.DataFrame, categories: dict[str, str]) -> dic
     }
 
 
+_ABS_GROUP_CAPEX_USD = 100_000.0
+
+
+def _spec_quote_formula(spec: CovenantSpec) -> str:
+    return f"{spec.quote or ''} {spec.formula_description or ''}".casefold()
+
+
+def looks_like_group_capex_absolute_language(quote_and_formula: str) -> bool:
+    """Group (consolidated) capital expenditure mentioned as a sum, not vs EBITDA."""
+    q = (quote_and_formula or "").casefold()
+    return bool(
+        ("капитальн" in q and "групп" in q)
+        or "group capex" in q
+        or "group capital" in q
+        or "капитальные затраты группы" in q
+        or "capex of the group" in q
+        or ("капитальн" in q and "консолидир" in q)
+    )
+
+
+def looks_like_ebitda_ratio_semantics(quote_and_formula: str) -> bool:
+    """True when the clause measures Group-capex *relative to* EBITDA."""
+    q = (quote_and_formula or "").casefold()
+    if "ebitda" not in q:
+        return False
+    return bool(
+        "к ebitda" in q
+        or "к\u00a0ebitda" in q
+        or "/ ebitda" in q
+        or "/ebitda" in q
+        or ("отношени" in q and "ebitda" in q)
+        or ("ratio" in q and "ebitda" in q)
+        or ("ebitda" in q and "x" in q and "капитальн" in q)
+        or ("ebitda заёмщика" in q)
+        or ("ebitda заемщика" in q)
+        or ("borrower" in q and "ebitda" in q and ("отношени" in q or "ratio" in q or "/" in q))
+    )
+
+
+def looks_like_outside_borrower_capex(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    return bool(
+        "за пределами заёмщика" in q
+        or "за пределами заемщика" in q
+        or "outside the borrower" in q
+        or "outside of the borrower" in q
+        or "beyond the borrower" in q
+        or "excluding the borrower" in q
+    )
+
+
+def is_absolute_group_capex_ceiling(spec: CovenantSpec) -> bool:
+    """Monetary Group-capex ceiling (≥ ~$100k), not a Group-capex/EBITDA ratio."""
+    try:
+        thr = float(spec.threshold)
+    except (TypeError, ValueError):
+        return False
+    if thr < _ABS_GROUP_CAPEX_USD:
+        return False
+    q = _spec_quote_formula(spec)
+    if looks_like_ebitda_ratio_semantics(q):
+        return False
+    if looks_like_group_capex_absolute_language(q):
+        return True
+    # LLM often labels absolute Group-capex ceilings as ratio_group_capex_to_ebitda.
+    return spec.covenant_type == "ratio_group_capex_to_ebitda" and (
+        "капитальн" in q or "capex" in q
+    )
+
+
+def evaluate_sum_group_capex(
+    spec: CovenantSpec,
+    period_df: pd.DataFrame,
+    categories: dict[str, str],
+    group_capex: float,
+    own_capex: float | None = None,
+) -> CovenantResult:
+    """Absolute Group-capex (optionally minus borrower own) vs monetary threshold."""
+    q = _spec_quote_formula(spec)
+    value = abs(float(group_capex))
+    flags = ["absolute_group_capex_ceiling"]
+    own_ids: list[str] = []
+    own_used: float | None = None
+    if looks_like_outside_borrower_capex(q):
+        if own_capex is None:
+            own_used, own_ids = borrower_own_capex(period_df, categories)
+        else:
+            own_used = abs(float(own_capex))
+        value = max(0.0, value - own_used)
+        flags.append(f"group_capex_minus_own own={own_used}")
+    status = verdict(value, spec.comparator, spec.threshold)
+    return CovenantResult(
+        clause=spec.clause,
+        status=status,
+        actual=round(value, 2) if value > 0 else 0.01,
+        contributing_txn_ids=own_ids,
+        flags=flags,
+        inputs={
+            "group_capex": float(group_capex),
+            "own_capex": own_used,
+            "value_raw": value,
+            "total": value,
+            "numerator": value,
+            "period_row_count": int(len(period_df)),
+            "currency_mix": _currency_mix(period_df),
+        },
+    )
+
+
+
+def evaluate_description_bucket(
+    spec: CovenantSpec,
+    period_df: pd.DataFrame,
+    bucket: str | None = None,
+) -> CovenantResult:
+    """Sum (or max-per — caller reduces quarters) of description-bucket outflows."""
+    b = bucket or getattr(spec, "description_bucket", None)
+    if not b:
+        return _missing_cats_stub(spec, ["description_bucket missing — stub"])
+    q = f"{spec.quote or ''} {spec.formula_description or ''}"
+    total, ids = sum_description_bucket(period_df, b, q)
+    status = verdict(total, spec.comparator, spec.threshold)
+    return CovenantResult(
+        clause=spec.clause,
+        status=status,
+        actual=round(total, 2) if total > 0 else 0.01,
+        contributing_txn_ids=ids,
+        flags=[f"description_bucket={b}"],
+        inputs={
+            "value_raw": total,
+            "total": total,
+            "numerator": total,
+            "description_bucket": b,
+            "period_row_count": int(len(period_df)),
+            "currency_mix": _currency_mix(period_df),
+        },
+    )
+
+
+def evaluate_sum_categories_vs_group_pct(
+    spec: CovenantSpec,
+    period_df: pd.DataFrame,
+    categories: dict[str, str],
+    group_capex: float,
+) -> CovenantResult:
+    """actual = sum(|filter cats|); compare against (threshold/100)*group_capex."""
+    cats = _cat_list(spec.filter_categories, spec.filter_category, default=None)
+    if not cats:
+        return _missing_cats_stub(spec, ["pct_of_group_capex missing filter categories — stub"])
+    total, ids = _sum_cats(period_df, categories, cats)
+    value = abs(float(total))
+    limit = abs(float(group_capex)) * (float(spec.threshold) / 100.0)
+    # Verdict against the derived monetary limit; expose raw sum as actual.
+    status = verdict(value, spec.comparator, limit)
+    return CovenantResult(
+        clause=spec.clause,
+        status=status,
+        actual=round(value, 2) if value > 0 else 0.01,
+        contributing_txn_ids=ids,
+        flags=[f"pct_of_group_capex thr%={spec.threshold} limit={limit}"],
+        inputs={
+            "value_raw": value,
+            "total": value,
+            "numerator": value,
+            "group_capex": float(group_capex),
+            "pct_limit": limit,
+            "filter_categories": cats,
+            "period_row_count": int(len(period_df)),
+            "currency_mix": _currency_mix(period_df),
+        },
+    )
+
+
 def evaluate_ratio_group_capex_to_ebitda(
     spec: CovenantSpec, period_df: pd.DataFrame, categories: dict[str, str], group_capex: float
 ) -> CovenantResult:
@@ -1412,12 +1641,49 @@ def _off_ledger_sum(
     return total
 
 
-def apply_springing(spec: CovenantSpec, result: CovenantResult) -> CovenantResult:
-    """Conditional covenant: trigger not met → COMPLIANT, keep real actual."""
+def apply_springing(
+    spec: CovenantSpec,
+    result: CovenantResult,
+    *,
+    trigger_value: float | None = None,
+) -> CovenantResult:
+    """Conditional covenant: trigger not met → COMPLIANT, keep real actual.
+
+    springing_mode (Python-only refine marker):
+      - numerator_above / None: legacy — demote BREACH when |numerator| <= threshold
+      - own_capex_above / trigger_above: active only when trigger_value > threshold
+      - leverage_above: active only when trigger_value (NLR) > threshold
+      - min_quarter_revenue_below: active only when trigger_value (min q rev) < threshold
+    """
     threshold = spec.springing_min_numerator
-    if threshold is None or result.status != "BREACH":
+    if threshold is None:
         return result
-    # Prefer USD payment totals over ratio value_raw (UPGRADE-PLAN-V2 B6).
+    mode = getattr(spec, "springing_mode", None) or "numerator_above"
+
+    if mode in {"own_capex_above", "trigger_above", "leverage_above"}:
+        if trigger_value is None:
+            return result
+        if abs(float(trigger_value)) <= float(threshold):
+            result.status = "COMPLIANT"
+            label = "leverage" if mode == "leverage_above" else "trigger"
+            result.flags.append(
+                f"springing не сработал ({label}={abs(float(trigger_value))} <= {threshold})"
+            )
+        return result
+
+    if mode == "min_quarter_revenue_below":
+        if trigger_value is None:
+            return result
+        if float(trigger_value) >= float(threshold):
+            result.status = "COMPLIANT"
+            result.flags.append(
+                f"springing не сработал (min_quarter_rev={float(trigger_value)} >= {threshold})"
+            )
+        return result
+
+    # Legacy numerator_above: only demote BREACH.
+    if result.status != "BREACH":
+        return result
     numerator = result.inputs.get("numerator")
     if numerator is None:
         numerator = result.inputs.get("total")
@@ -1434,6 +1700,49 @@ def apply_springing(spec: CovenantSpec, result: CovenantResult) -> CovenantResul
         f"springing не сработал (|num|={abs(float(numerator))} <= {threshold})"
     )
     return result
+
+
+def evaluate_ebitda_plus_categories(
+    spec: CovenantSpec,
+    period_df: pd.DataFrame,
+    categories: dict[str, str],
+    materiality_threshold_usd: float | None = None,
+) -> CovenantResult:
+    """Absolute floor: EBITDA + sum(|plus cats|) vs threshold (not a ratio)."""
+    from agent.schemas import EBITDA_OPEX_CATEGORIES
+
+    plus = list(getattr(spec, "ebitda_plus_categories", None) or [])
+    if not plus:
+        return _missing_cats_stub(spec, ["ebitda_plus_categories missing — stub"])
+    rev_raw, rev_ids = _sum_cats(period_df, categories, ["revenue"])
+    opex_raw, opex_ids = _sum_cats(period_df, categories, list(EBITDA_OPEX_CATEGORIES))
+    ebitda = float(rev_raw) - abs(float(opex_raw))
+    quote = f"{spec.quote or ''} {spec.formula_description or ''}".casefold()
+    addback_ids: list[str] = []
+    if "скорректирован" in quote or "adjusted ebitda" in quote:
+        addback_total, addback_ids = _one_off_addbacks(
+            period_df, categories, materiality_threshold_usd
+        )
+        ebitda = ebitda + addback_total
+    plus_raw, plus_ids = _sum_cats(period_df, categories, plus)
+    value = float(ebitda) + abs(float(plus_raw))
+    status = verdict(value, spec.comparator, spec.threshold)
+    return CovenantResult(
+        clause=spec.clause,
+        status=status,
+        actual=round(abs(value), 2) if abs(value) > 0 else 0.01,
+        contributing_txn_ids=list(dict.fromkeys(rev_ids + opex_ids + addback_ids + plus_ids)),
+        flags=[f"ebitda_plus_categories={plus}"],
+        inputs={
+            "ebitda": float(ebitda),
+            "plus_sum": abs(float(plus_raw)),
+            "value_raw": value,
+            "total": value,
+            "numerator": value,
+            "period_row_count": int(len(period_df)),
+            "currency_mix": _currency_mix(period_df),
+        },
+    )
 
 
 def evaluate_ratio_generic(
@@ -1779,6 +2088,378 @@ def looks_like_unrestricted_subsidiary_ratio(quote_and_formula: str) -> bool:
     )
 
 
+def looks_like_unrestricted_language(quote_and_formula: str) -> bool:
+    """Unrestricted / group-transfer language (absolute cap or ratio)."""
+    q = (quote_and_formula or "").casefold()
+    if looks_like_unrestricted_subsidiary_ratio(q):
+        return True
+    return any(
+        tok in q
+        for tok in (
+            "передач",
+            "transfer",
+            "unrestricted",
+            "неограниченн",
+            "группе",
+            "to the group",
+            "group compan",
+        )
+    ) and any(
+        tok in q
+        for tok in ("дочерн", "subsidiar", "групп", "group", "неограниченн", "unrestricted")
+    )
+
+
+def looks_like_ratio_language(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    if "отношен" in q or "ratio" in q:
+        return True
+    # Trailing "x" multiplier (2.5x) — not a bare letter x in a word.
+    return bool(re.search(r"\d\s*x\b|\bx\s*\d", q))
+
+
+def looks_like_unrestricted_absolute_cap(quote_and_formula: str, threshold: float) -> bool:
+    """Monetary ceiling on Unrestricted/group transfers (not transfer/capex ratio)."""
+    if float(threshold) < 100_000.0:
+        return False
+    return looks_like_unrestricted_language(quote_and_formula)
+
+
+_LEVERAGE_TRIGGER_RE = re.compile(
+    r"(?:net\s+leverage|n\s*l\s*r|чистый\s+леверидж|леверидж|leverage\s+ratio)"
+    r".{0,40}?"
+    r"(?:>|≥|exceed|превыш\w*|above|более|свыше)?"
+    r".{0,10}?"
+    r"(\d+(?:[.,]\d+)?)\s*x?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def scrape_leverage_springing_threshold(quote_and_formula: str) -> float | None:
+    """Parse NLR / leverage trigger (e.g. «если Net Leverage > 2.5x»)."""
+    q = quote_and_formula or ""
+    if not any(t in q.casefold() for t in ("leverage", "леверидж", "nlr", "n l r")):
+        return None
+    if not any(
+        t in q.casefold()
+        for t in ("если", "if ", "when ", "only if", "только если", "при условии", "springing")
+    ):
+        # Still allow «Net Leverage Ratio exceeds 2.5x» without explicit if.
+        if not any(t in q.casefold() for t in ("exceed", "превыш", "above", "более", ">")):
+            return None
+    m = _LEVERAGE_TRIGGER_RE.search(q)
+    if not m:
+        return None
+    raw = m.group(1).replace(",", ".")
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    if not (0.1 <= val <= 50.0):
+        return None
+    return val
+
+
+def looks_like_ebitda_plus_financing_floor(quote_and_formula: str, threshold: float) -> bool:
+    """EBITDA + financing proceeds ≥ absolute $ floor (not financing/EBITDA ratio)."""
+    if float(threshold) < 1_000_000.0:
+        return False
+    q = (quote_and_formula or "").casefold()
+    if "ebitda" not in q:
+        return False
+    has_fin = (
+        ("поступлен" in q and "финанс" in q)
+        or "financing proceeds" in q
+        or "financing_proceeds" in q
+        or ("financ" in q and ("proceed" in q or "поступлен" in q or "+" in q or "плюс" in q))
+    )
+    if not has_fin:
+        return False
+    # Ratio springing uses small thresholds; reject explicit /EBITDA ratio shape.
+    if "отношен" in q or "ratio of" in q:
+        return False
+    if re.search(r"ebitda\s*/|/ \s*ebitda|/\s*ebitda", q):
+        return False
+    return True
+
+
+def normalize_percent_threshold(spec: CovenantSpec) -> float | None:
+    """When quote states a percent and threshold is 1..100, return fraction (80 → 0.80).
+
+    Skips absolute $ caps and pct_of_group_capex (already treats threshold as percent).
+    """
+    thr = float(spec.threshold)
+    if thr <= 1.0 or thr > 100.0:
+        return None
+    if getattr(spec, "pct_of_group_capex", False):
+        return None
+    q = f"{spec.quote or ''} {spec.formula_description or ''}"
+    qlow = q.casefold()
+    if not any(t in qlow for t in ("%", "процент", "percent", "pct")):
+        return None
+    # Absolute monetary language with a coincidental % nearby — keep dollars.
+    if thr >= 1000:
+        return None
+    if "$" in q and thr >= 100:
+        return None
+    # Ratio / share covenants only.
+    if not any(
+        t in qlow
+        for t in (
+            "отношен",
+            "ratio",
+            "доля",
+            "share",
+            "к выручк",
+            "of revenue",
+            "of выручк",
+            "capex",
+            "капитальн",
+        )
+    ):
+        return None
+    return thr / 100.0
+
+
+
+def looks_like_any_quarter_metric(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    if "квартал" not in q and "quarter" not in q:
+        return False
+    return bool(
+        "любой финансовый квартал" in q
+        or "любом отдельном финансовом квартале" in q
+        or "любом отдельном" in q
+        or "каждом финансовом квартале" in q
+        or "каждый финансовый квартал" in q
+        or "за любой" in q
+        or "в любом" in q
+        or "any fiscal quarter" in q
+        or "any individual fiscal quarter" in q
+        or "each fiscal quarter" in q
+        or "in any" in q and "quarter" in q
+    )
+
+
+def calendar_quarter_windows(period_start: str, period_end: str) -> list[tuple[str, str]]:
+    """Calendar Q1–Q4 windows overlapping [period_start, period_end]."""
+    start = pd.Timestamp(period_start)
+    end = pd.Timestamp(period_end)
+    year = int(start.year)
+    # Cover years spanning the period.
+    years = range(year, int(end.year) + 1)
+    out: list[tuple[str, str]] = []
+    for y in years:
+        for qstart, qend in (
+            (f"{y}-01-01", f"{y}-03-31"),
+            (f"{y}-04-01", f"{y}-06-30"),
+            (f"{y}-07-01", f"{y}-09-30"),
+            (f"{y}-10-01", f"{y}-12-31"),
+        ):
+            qs, qe = pd.Timestamp(qstart), pd.Timestamp(qend)
+            if qe < start or qs > end:
+                continue
+            out.append((qstart, qend))
+    return out
+
+
+def reduce_over_calendar_quarters(
+    period_df: pd.DataFrame,
+    period_start: str,
+    period_end: str,
+    reduce: str,
+    metric_fn,
+) -> tuple[float, list[str], list[str]]:
+    """Apply metric_fn(quarter_df) -> (value, ids, flags) per quarter; min/max reduce."""
+    windows = calendar_quarter_windows(period_start, period_end)
+    if not windows:
+        val, ids, flags = metric_fn(period_df)
+        return float(val), list(ids), list(flags)
+    values: list[float] = []
+    all_ids: list[str] = []
+    flags: list[str] = [f"quarter_reduce={reduce} n={len(windows)}"]
+    for qs, qe in windows:
+        qdf = filter_period(period_df, qs, qe)
+        val, ids, qflags = metric_fn(qdf)
+        values.append(float(val))
+        all_ids.extend(ids)
+        flags.extend(qflags)
+    if not values:
+        return 0.0, all_ids, flags
+    if reduce == "max":
+        best = max(values)
+    else:
+        best = min(values)
+    flags.append(f"quarter_values={values}")
+    return best, all_ids, flags
+
+
+_MARKETING_NEEDLES = (
+    "marketing",
+    "advertising",
+    "advertisement",
+    "exhibition",
+    "brand campaign",
+    "brand marketing",
+    "media buy",
+    "sponsorship",
+    "newsletter marketing",
+    "маркетинг",
+    "реклам",
+)
+_CONSULTING_NEEDLES = (
+    "consulting",
+    "consultancy",
+    "advisory",
+    "professional services",
+    "консультац",
+    "советник",
+)
+_DESC_CREDIT_NEEDLES = (
+    "refund",
+    "rebate",
+    "overbilling",
+    "credit note",
+    "overpayment",
+    "возврат",
+    "скидк",
+    "interest income",
+    "процентн",
+)
+
+
+def description_bucket_from_quote(quote_and_formula: str) -> str | None:
+    q = (quote_and_formula or "").casefold()
+    if any(t in q for t in ("маркетинг", "marketing", "advertis", "реклам")):
+        return "marketing"
+    if any(t in q for t in ("консультац", "consulting", "consultancy", "advisory engagement")):
+        return "consulting"
+    return None
+
+
+def _bucket_needles(bucket: str, quote_and_formula: str | None = None) -> tuple[str, ...]:
+    if bucket == "marketing":
+        needles = list(_MARKETING_NEEDLES)
+        q = (quote_and_formula or "").casefold()
+        # Include advisory only when the marketing article itself names it.
+        if any(t in q for t in ("advisory", "бренд", "brand advisory", "brand engagement")):
+            needles.extend(("advisory", "brand advisory"))
+        return tuple(needles)
+    if bucket == "consulting":
+        return _CONSULTING_NEEDLES
+    return ()
+
+
+def description_bucket_mask(
+    period_df: pd.DataFrame,
+    bucket: str,
+    quote_and_formula: str | None = None,
+) -> pd.Series:
+    """Outflow rows whose description matches the bucket; credits/refunds excluded."""
+    if period_df.empty:
+        return pd.Series(False, index=period_df.index)
+    needles = _bucket_needles(bucket, quote_and_formula)
+    col = _amount_col(period_df)
+    descs = period_df["description"].astype(str).str.casefold() if "description" in period_df.columns else pd.Series("", index=period_df.index)
+    hit = descs.apply(lambda d: any(n in d for n in needles))
+    credit = descs.apply(lambda d: any(n in d for n in _DESC_CREDIT_NEEDLES))
+    outflow = period_df[col].fillna(0.0).astype(float) < 0
+    return hit & outflow & ~credit
+
+
+def sum_description_bucket(
+    period_df: pd.DataFrame,
+    bucket: str,
+    quote_and_formula: str | None = None,
+) -> tuple[float, list[str]]:
+    mask = description_bucket_mask(period_df, bucket, quote_and_formula)
+    if not mask.any():
+        return 0.0, []
+    col = _amount_col(period_df)
+    rows = period_df[mask]
+    total = float(-rows[col].sum())  # outflows → positive expense
+    return abs(total), list(rows["txn_id"].astype(str))
+
+
+def looks_like_pct_of_group_capex(quote_and_formula: str, threshold: float) -> bool:
+    q = (quote_and_formula or "").casefold()
+    if not (0 < float(threshold) <= 100):
+        return False
+    if "групп" not in q and "group" not in q:
+        return False
+    if "капитальн" not in q and "capex" not in q:
+        return False
+    return bool(
+        "%" in q
+        or "процент" in q
+        or "percent" in q
+        or "per cent" in q
+    )
+
+
+def scrape_quarterly_revenue_waiver_floor(document_text: str | None) -> float | None:
+    """Parse «до тех пор пока Выручка … не менее $X» / while revenue … at least $X."""
+    if not document_text:
+        return None
+    patterns = [
+        re.compile(
+            r"до\s+тех\s+пор\s+пока\s+выручка.{0,160}?не\s+менее\s*\$?\s*([\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"so\s+long\s+as\s+revenue.{0,160}?(?:at\s+least|not\s+less\s+than)\s*\$?\s*([\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"пока\s+выручка\s+за\s+каждый\s+финансовый\s+квартал.{0,120}?не\s+менее\s*\$?\s*([\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ]
+    for pat in patterns:
+        m = pat.search(document_text)
+        if not m:
+            continue
+        raw = m.group(1).replace(",", "").replace(" ", "")
+        try:
+            return float(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def looks_like_borrower_capex_to_revenue(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    if looks_like_group_capex_ebitda_ratio(q):
+        return False
+    if looks_like_ebitda_ratio_semantics(q):
+        return False
+    has_capex = "капитальн" in q or "capex" in q
+    has_rev = "выручк" in q or "revenue" in q
+    ratio_ish = "отношени" in q or "/" in q or "ratio" in q or "0." in q
+    return has_capex and has_rev and ratio_ish
+
+
+def alias_financing_categories(cats: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for c in cats or []:
+        out.append("financing_proceeds" if c == "financing" else c)
+    return out
+
+
+def looks_like_financing_debt_ratio(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    return bool(
+        "финанс" in q
+        or "financing" in q
+        or "долг" in q
+        or "debt" in q
+        or "леверидж" in q
+        or "leverage" in q
+        or "долговой" in q
+    )
+
+
+
 def looks_like_group_capex_ebitda_ratio(quote_and_formula: str) -> bool:
     """True only for real Group-capex / borrower-EBITDA clauses.
 
@@ -1889,10 +2570,18 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
             }
         )
 
-    # Transfers to Unrestricted subsidiaries / borrower's capex — before group_capex.
+    # Transfers to Unrestricted subsidiaries — absolute $ cap OR ratio vs capex.
     # LLM formula_description often says "not Group capex … EBITDA", which would
     # falsely trip the group_capex heuristic if checked first.
-    elif looks_like_unrestricted_subsidiary_ratio(q):
+    elif looks_like_unrestricted_absolute_cap(q, float(spec.threshold)):
+        updates["covenant_type"] = "sum_category"
+        updates["filter_categories"] = ["unrestricted_subsidiary_transfer"]
+        updates["filter_category"] = "unrestricted_subsidiary_transfer"
+        updates["numerator_categories"] = []
+        updates["denominator_categories"] = []
+        updates["numerator_category"] = None
+        updates["denominator_category"] = None
+    elif looks_like_unrestricted_subsidiary_ratio(q) and float(spec.threshold) < 100_000.0:
         updates["covenant_type"] = "ratio_generic"
         updates["numerator_categories"] = ["unrestricted_subsidiary_transfer"]
         # Denominator = all capital outflows (capex ∪ transfers).
@@ -1911,10 +2600,24 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
         updates["denominator_categories"] = []
         updates["denominator_category"] = None
 
+    # Absolute floor: EBITDA + financing proceeds ≥ $X (before financing/EBITDA ratio rewrite).
+    if looks_like_ebitda_plus_financing_floor(q, float(spec.threshold)):
+        updates["covenant_type"] = "ratio_generic"
+        updates["ebitda_plus_categories"] = ["financing_proceeds"]
+        updates["numerator_categories"] = []
+        updates["denominator_categories"] = []
+        updates["numerator_category"] = None
+        updates["denominator_category"] = None
+
     # R2: EBITDA in quote — strip garbage den=["other"], keep ratio_generic for tree synth.
     # Skip when the clause is Unrestricted-subsidiary transfers (formula_description may
-    # mention EBITDA only to *deny* group-capex shape).
-    if "ebitda" in q and not looks_like_unrestricted_subsidiary_ratio(q):
+    # mention EBITDA only to *deny* group-capex shape) or ebitda+financing absolute floor.
+    if (
+        "ebitda" in q
+        and not looks_like_unrestricted_subsidiary_ratio(q)
+        and not looks_like_unrestricted_absolute_cap(q, float(spec.threshold))
+        and not updates.get("ebitda_plus_categories")
+    ):
         updates.setdefault("covenant_type", "ratio_generic")
         den = list(
             updates.get("denominator_categories")
@@ -1953,9 +2656,183 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
             updates["denominator_category"] = None
 
     if "springing" in q or "только если" in q or "при условии что" in q:
-        if "поступлен" in q and "финанс" in q:
+        if "поступлен" in q and "финанс" in q and not updates.get("ebitda_plus_categories"):
             updates.setdefault("covenant_type", "ratio_generic")
             updates.setdefault("numerator_categories", ["financing_proceeds"])
+
+    # Absolute Group-capex monetary ceiling (not Group/EBITDA ratio).
+    if is_absolute_group_capex_ceiling(spec.model_copy(update=updates) if updates else spec):
+        # Keep ratio_group_capex_to_ebitda type so needs_group + enum absolute branch fire.
+        updates.setdefault("covenant_type", "ratio_group_capex_to_ebitda")
+        updates["numerator_categories"] = []
+        updates["denominator_categories"] = []
+        updates["numerator_category"] = None
+        updates["denominator_category"] = None
+
+    # Financing / debt leverage: financing → financing_proceeds.
+    if looks_like_financing_debt_ratio(q) or "financing" in (
+        list(updates.get("numerator_categories", spec.numerator_categories or []))
+        + list(updates.get("filter_categories", spec.filter_categories or []))
+        + ([updates["numerator_category"]] if updates.get("numerator_category") else [])
+        + ([spec.numerator_category] if spec.numerator_category else [])
+    ):
+        num = alias_financing_categories(
+            updates.get("numerator_categories", spec.numerator_categories)
+        )
+        filt = alias_financing_categories(
+            updates.get("filter_categories", spec.filter_categories)
+        )
+        den = alias_financing_categories(
+            updates.get("denominator_categories", spec.denominator_categories)
+        )
+        if num != list(spec.numerator_categories or []):
+            updates["numerator_categories"] = num
+        if filt != list(spec.filter_categories or []):
+            updates["filter_categories"] = filt
+        if den != list(spec.denominator_categories or []):
+            updates["denominator_categories"] = den
+        if (updates.get("numerator_category") or spec.numerator_category) == "financing":
+            updates["numerator_category"] = "financing_proceeds"
+        if (updates.get("filter_category") or spec.filter_category) == "financing":
+            updates["filter_category"] = "financing_proceeds"
+
+    # Marketing / consulting description buckets (avoid garbage filter=other stubs).
+    bucket = description_bucket_from_quote(q)
+    # Truncated quotes («такие совокупные расходы») — recover article from nearby doc text.
+    if not bucket and document_text and (
+        "other" in (spec.filter_categories or [])
+        or spec.filter_category == "other"
+        or "такие совокупные расходы" in q
+    ):
+        dlow = document_text.casefold()
+        frag = (spec.quote or "").strip()[:96].casefold()
+        window = dlow
+        if frag:
+            pos = dlow.find(frag[:48]) if len(frag) >= 48 else dlow.find(frag)
+            if pos >= 0:
+                window = dlow[max(0, pos - 500) : pos + max(len(frag), 200) + 200]
+        if "маркетингов" in window or "marketing expense" in window or "marketing cost" in window:
+            bucket = "marketing"
+        elif "консультац" in window or "consulting" in window:
+            bucket = "consulting"
+    if bucket:
+        updates["description_bucket"] = bucket
+        if "other" in (updates.get("filter_categories") or spec.filter_categories or []) or (
+            (updates.get("filter_category") or spec.filter_category) == "other"
+        ):
+            updates["filter_categories"] = []
+            updates["filter_category"] = None
+        if "other" in (updates.get("numerator_categories") or spec.numerator_categories or []) or (
+            (updates.get("numerator_category") or spec.numerator_category) == "other"
+        ):
+            updates["numerator_categories"] = []
+            updates["numerator_category"] = None
+        # Consulting / EBITDA stays ratio_generic; pure marketing caps → sum/max.
+        if bucket == "marketing" and "ebitda" not in q:
+            if looks_like_any_quarter_metric(q) and spec.comparator == "max":
+                updates["covenant_type"] = "max_category"
+            else:
+                updates.setdefault("covenant_type", "sum_category")
+        if bucket == "consulting" and "ebitda" in q:
+            updates.setdefault("covenant_type", "ratio_generic")
+
+    # Any-quarter min/max aggregation marker.
+    if looks_like_any_quarter_metric(q):
+        updates["quarter_reduce"] = "max" if spec.comparator == "max" else "min"
+
+    # Springing: own-capex → insurance floor.
+    if (
+        ("страхов" in q or "insurance" in q)
+        and ("капитальн" in q or "capex" in q)
+        and ("если" in q or "превышают" in q or "springing" in q or "при условии" in q)
+    ):
+        updates["covenant_type"] = "sum_category"
+        updates["filter_categories"] = ["insurance"]
+        updates["filter_category"] = "insurance"
+        updates["springing_mode"] = "own_capex_above"
+        if spec.springing_min_numerator is None:
+            # Best-effort: first $ amount that looks like the capex trigger (>100k).
+            for m in re.finditer(
+                r"\$\s*([\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)",
+                f"{spec.quote or ''} {spec.formula_description or ''}",
+            ):
+                try:
+                    amt = float(m.group(1).replace(",", ""))
+                except ValueError:
+                    continue
+                if amt >= 100_000:
+                    updates["springing_min_numerator"] = amt
+                    break
+
+    # Capex / revenue with quarterly-revenue waiver (from document body if quote truncated).
+    if looks_like_borrower_capex_to_revenue(q) or (
+        document_text
+        and scrape_quarterly_revenue_waiver_floor(document_text) is not None
+        and ("капитальн" in q or "capex" in q)
+        and ("выручк" in q or "revenue" in q or "0.32" in q)
+    ):
+        if not looks_like_group_capex_ebitda_ratio(q) and not is_absolute_group_capex_ceiling(
+            spec.model_copy(update=updates) if updates else spec
+        ):
+            updates["covenant_type"] = "ratio_generic"
+            updates["numerator_categories"] = ["capex"]
+            updates["denominator_categories"] = ["revenue"]
+            updates["numerator_category"] = None
+            updates["denominator_category"] = None
+            floor = scrape_quarterly_revenue_waiver_floor(document_text) or scrape_quarterly_revenue_waiver_floor(
+                f"{spec.quote or ''}\n{document_text or ''}"
+            )
+            if floor is not None:
+                updates["springing_min_numerator"] = floor
+                updates["springing_mode"] = "min_quarter_revenue_below"
+
+    # Sum of categories ≤ % of Group capex.
+    thr = float(updates.get("threshold", spec.threshold))
+    if looks_like_pct_of_group_capex(q, thr):
+        cats = list(updates.get("filter_categories") or spec.filter_categories or [])
+        if not cats and ("процент" in q or "interest" in q) and ("аренд" in q or "rent" in q):
+            cats = ["interest_expense", "rent"]
+        if cats:
+            updates["covenant_type"] = "sum_category"
+            updates["filter_categories"] = cats
+            updates["pct_of_group_capex"] = True
+
+    # Plain quarterly EBITDA floor (not a ratio): empty num + ebitda + any-quarter.
+    if (
+        "ebitda" in q
+        and looks_like_any_quarter_metric(q)
+        and spec.comparator == "min"
+        and float(spec.threshold) >= 1000
+        and not looks_like_ebitda_ratio_semantics(q)
+        and not updates.get("ebitda_plus_categories")
+    ):
+        # Keep ratio_generic; evaluate path rebuilds EBITDA and applies quarter_reduce.
+        updates.setdefault("covenant_type", "ratio_generic")
+        updates.setdefault("quarter_reduce", "min")
+        updates["numerator_categories"] = []
+        updates["denominator_categories"] = []
+        updates["numerator_category"] = None
+        updates["denominator_category"] = None
+
+    # Springing: Net Leverage / NLR trigger → absolute transfer / marketing-style sum.
+    lev = scrape_leverage_springing_threshold(q)
+    if lev is not None and (
+        looks_like_unrestricted_absolute_cap(q, float(updates.get("threshold", spec.threshold)))
+        or looks_like_unrestricted_language(q)
+    ):
+        updates.setdefault("covenant_type", "sum_category")
+        if not (updates.get("filter_categories") or spec.filter_categories):
+            updates["filter_categories"] = ["unrestricted_subsidiary_transfer"]
+            updates["filter_category"] = "unrestricted_subsidiary_transfer"
+        updates["springing_mode"] = "leverage_above"
+        updates["springing_min_numerator"] = lev
+
+    # Percent threshold written as 80 vs ratio actual 0.78.
+    pct_thr = normalize_percent_threshold(
+        spec.model_copy(update=updates) if updates else spec
+    )
+    if pct_thr is not None:
+        updates["threshold"] = pct_thr
 
     if not updates:
         return spec
@@ -2284,7 +3161,7 @@ def evaluate_sum_related_party_payments(
     spec: CovenantSpec,
     period_df: pd.DataFrame,
     related_parties: list[RelatedParty],
-    threshold_pct: float,
+    threshold_pct: float | None,
     categories: dict[str, str] | None = None,
 ) -> CovenantResult:
     """Sum (abs) of outflows to related parties.

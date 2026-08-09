@@ -74,9 +74,16 @@ from agent.s4_engine import (
     evaluate_ratio_group_capex_to_ebitda,
     evaluate_revenue_minus_max_category,
     evaluate_sum_category,
+    evaluate_sum_group_capex,
     evaluate_sum_related_party_payments,
     evaluate_sum_revenue,
+    evaluate_description_bucket,
+    evaluate_sum_categories_vs_group_pct,
+    evaluate_ebitda_plus_categories,
     fill_missing_amounts_from_reclassifications,
+    is_absolute_group_capex_ceiling,
+    reduce_over_calendar_quarters,
+    sum_description_bucket,
     filter_df_by_relevance,
     filter_period,
     infer_to_category_from_quote,
@@ -306,7 +313,9 @@ def _merge_auditor_facts(
         flags.append("auditor reclass denial: scraped category-move rows withheld")
         for rec in scraped_fills:
             tid = str(rec.txn_id) if rec.txn_id else ""
-            if tid and tid in existing_any and tid not in existing_txn and rec.amount is not None:
+            if not tid or rec.amount is None or tid in existing_txn:
+                continue
+            if tid in existing_any:
                 # Fill amount on an existing structured row.
                 for r in reclassifications:
                     if str(r.txn_id) == tid and r.amount is None:
@@ -314,6 +323,11 @@ def _merge_auditor_facts(
                         flags.append(f"scraped missing amount for {tid} from auditor notes")
                         existing_txn.add(tid)
                         break
+            else:
+                # Amount-only fill for NaN ledger rows (treasury / notes) — not a category move.
+                reclassifications.append(rec)
+                flags.append(f"scraped missing amount for {tid} from notes/treasury (denial-safe fill)")
+                existing_txn.add(tid)
     else:
         for rec in scraped_fills:
             if rec.txn_id and str(rec.txn_id) not in existing_txn:
@@ -1183,7 +1197,10 @@ async def _finish_case(
         loan_facts = loan_facts.model_copy(update={"covenants": demoted})
         flags.append("group_capex_type_demoted_via_quote")
 
-    needs_group = any(c.covenant_type == "ratio_group_capex_to_ebitda" for c in loan_facts.covenants)
+    needs_group = any(
+        c.covenant_type == "ratio_group_capex_to_ebitda" or getattr(c, "pct_of_group_capex", False)
+        for c in loan_facts.covenants
+    )
     if not needs_group:
         # Quote may still demand Group even if type refine missed (second line of defence).
         for c in loan_facts.covenants:
@@ -1471,6 +1488,7 @@ def _evaluate_and_flip(
         qlow = f"{spec.quote or ''} {spec.formula_description or ''}".casefold()
         synth_probe = synthesize_expr_from_enum(spec)
         ebitda_repair = "ebitda" in qlow and synth_probe is not None
+        desc_bucket_repair = bool(getattr(spec, "description_bucket", None))
         rp_repair = (
             spec.covenant_type == "sum_related_party_payments"
             or any(
@@ -1479,7 +1497,7 @@ def _evaluate_and_flip(
             )
         )
         # RP ratio clauses (threshold < 1) have no synth tree — still must not stub on ['other'].
-        if ebitda_repair or rp_repair:
+        if ebitda_repair or rp_repair or desc_bucket_repair:
             flags.extend(tax_flags)
             flags.append("taxonomy_repaired_via_ebitda_expr" if ebitda_repair else "taxonomy_repaired_via_rp")
             if sink is not None:
@@ -1506,7 +1524,14 @@ def _evaluate_and_flip(
             return cell, tax_flags, build_cell_trace(cell, spec=spec, stub_reason=reason, clause_flags=tax_flags)
 
     # R1: covenant aggregates use signal rows only (related-party retainers stay if relevant=true).
-    period_df, rel_flags = filter_df_by_relevance(period_df, relevance)
+    # Description-bucket covenants (marketing/consulting) keep the full frame — those rows
+    # are forced to other + relevance=false by design.
+    period_full = period_df
+    if getattr(spec, "description_bucket", None):
+        rel_flags = ["relevance_bypass_description_bucket"]
+        period_df = period_df
+    else:
+        period_df, rel_flags = filter_df_by_relevance(period_df, relevance)
     flags.extend(rel_flags)
 
     period_raw = period_df
@@ -1542,31 +1567,181 @@ def _evaluate_and_flip(
         adj_ebitda=adj_ebitda,
     )
 
+    def _springing_trigger(frame, cats: dict[str, str]) -> float | None:
+        mode = getattr(spec, "springing_mode", None)
+        if mode in {"own_capex_above", "trigger_above"}:
+            own, _ = borrower_own_capex(frame, cats)
+            return own
+        if mode == "leverage_above":
+            from agent.schemas import EBITDA_OPEX_CATEGORIES
+            from agent.s4_engine import _sum_cats
+
+            rev_raw, _ = _sum_cats(frame, cats, ["revenue"])
+            opex_raw, _ = _sum_cats(frame, cats, list(EBITDA_OPEX_CATEGORIES))
+            ebitda = float(rev_raw) - abs(float(opex_raw))
+            fin_raw, _ = _sum_cats(frame, cats, ["financing_proceeds"])
+            if ebitda <= 0:
+                return abs(float(fin_raw))  # undefined → treat as high leverage
+            return abs(float(fin_raw)) / abs(float(ebitda))
+        if mode == "min_quarter_revenue_below":
+            def _rev_metric(qdf):
+                from agent.s4_engine import _sum_cats
+
+                rev, ids = _sum_cats(qdf, cats, ["revenue"])
+                return float(rev), ids, []
+
+            val, _ids, _flags = reduce_over_calendar_quarters(
+                frame, spec.period_start, spec.period_end, "min", _rev_metric
+            )
+            return val
+        return None
+
     def _enum_eval(frame):
+        qred = getattr(spec, "quarter_reduce", None)
+        bucket = getattr(spec, "description_bucket", None)
+
+        def _with_quarters(base_eval, frm):
+            """Wrap a (frame)->CovenantResult evaluator with calendar-quarter reduce."""
+            if not qred:
+                return base_eval(frm)
+
+            def metric2(qdf):
+                r = base_eval(qdf)
+                raw = r.inputs.get("value_raw")
+                if raw is None:
+                    raw = r.inputs.get("total", r.actual)
+                return float(raw), list(r.contributing_txn_ids), list(r.flags)
+
+            val, ids, qflags = reduce_over_calendar_quarters(
+                frm, spec.period_start, spec.period_end, qred, metric2
+            )
+            status = "COMPLIANT" if (
+                (spec.comparator == "max" and val <= spec.threshold)
+                or (spec.comparator == "min" and val >= spec.threshold)
+            ) else "BREACH"
+            sample = base_eval(frm)
+            sample.status = status
+            sample.actual = round(abs(val), 2) if val != 0 else 0.01
+            sample.contributing_txn_ids = ids
+            sample.flags = list(sample.flags) + qflags
+            sample.inputs = {**sample.inputs, "value_raw": val, "total": abs(val), "numerator": abs(val)}
+            return sample
+
+        if bucket and spec.covenant_type in {"sum_category", "max_category", "unknown"}:
+            def _bucket_eval(frm):
+                return evaluate_description_bucket(spec, frm, bucket)
+
+            res = _with_quarters(_bucket_eval, frame) if qred else _bucket_eval(frame)
+
+            def recompute(subset, cats):
+                # cats unused for description buckets
+                r = (
+                    _with_quarters(lambda f: evaluate_description_bucket(spec, f, bucket), subset)
+                    if qred
+                    else evaluate_description_bucket(spec, subset, bucket)
+                )
+                return apply_springing(spec, r, trigger_value=_springing_trigger(subset, cats)).status
+
+            return res, None, recompute
+
+        if bucket and spec.covenant_type == "ratio_generic":
+            # consulting / EBITDA: numerator from description bucket
+            def _ratio_bucket_eval(frm, cats):
+                from agent.s4_engine import CovenantResult, verdict as _verdict
+                from agent.schemas import EBITDA_OPEX_CATEGORIES
+                from agent.s4_engine import _sum_cats, _currency_mix
+
+                num, ids = sum_description_bucket(
+                    frm, bucket, f"{spec.quote or ''} {spec.formula_description or ''}"
+                )
+                rev_raw, rev_ids = _sum_cats(frm, cats, ["revenue"])
+                opex_raw, opex_ids = _sum_cats(frm, cats, list(EBITDA_OPEX_CATEGORIES))
+                ebitda = float(rev_raw) - abs(float(opex_raw))
+                flags_l = [f"description_bucket_num={bucket}"]
+                if ebitda <= 0:
+                    flags_l.append("EBITDA <= 0 — ratio undefined")
+                    return CovenantResult(
+                        clause=spec.clause,
+                        status="BREACH" if spec.comparator == "max" else "COMPLIANT",
+                        actual=round(num, 2) if num > 0 else 0.01,
+                        contributing_txn_ids=ids + rev_ids + opex_ids,
+                        flags=flags_l,
+                        inputs={"numerator": num, "ebitda": ebitda, "value_raw": num, "total": num},
+                    )
+                ratio = num / ebitda
+                return CovenantResult(
+                    clause=spec.clause,
+                    status=_verdict(ratio, spec.comparator, spec.threshold),
+                    actual=round(abs(ratio), 2),
+                    contributing_txn_ids=ids + rev_ids + opex_ids,
+                    flags=flags_l,
+                    inputs={
+                        "numerator": num,
+                        "ebitda": ebitda,
+                        "value_raw": ratio,
+                        "total": num,
+                        "denominator": ebitda,
+                    },
+                )
+
+            res = _ratio_bucket_eval(frame, categories)
+
+            def recompute(subset, cats):
+                return apply_springing(
+                    spec, _ratio_bucket_eval(subset, cats), trigger_value=_springing_trigger(subset, cats)
+                ).status
+
+            return res, None, recompute
+
         if spec.covenant_type == "ratio_group_capex_to_ebitda":
             if group_capex_value is None:
                 return None, "missing group capex; stubbed", None
+            if is_absolute_group_capex_ceiling(spec):
+                own_val, _own_ids = borrower_own_capex(frame, categories)
+                res = evaluate_sum_group_capex(
+                    spec, frame, categories, group_capex_value, own_capex=own_val
+                )
+
+                def recompute(subset, cats):
+                    ov, _ = borrower_own_capex(subset, cats)
+                    return apply_springing(
+                        spec,
+                        evaluate_sum_group_capex(
+                            spec, subset, cats, group_capex_value, own_capex=ov
+                        ),
+                        trigger_value=_springing_trigger(subset, cats),
+                    ).status
+
+                return res, None, recompute
             res = evaluate_ratio_group_capex_to_ebitda(spec, frame, categories, group_capex_value)
 
             def recompute(subset, cats):
                 return apply_springing(
                     spec,
                     evaluate_ratio_group_capex_to_ebitda(spec, subset, cats, group_capex_value),
+                    trigger_value=_springing_trigger(subset, cats),
                 ).status
 
             return res, None, recompute
         if spec.covenant_type == "sum_revenue":
-            res = evaluate_sum_revenue(spec, frame, categories)
+            def _rev(frm):
+                return evaluate_sum_revenue(spec, frm, categories)
+
+            res = _with_quarters(_rev, frame) if qred else _rev(frame)
 
             def recompute(subset, cats):
-                return apply_springing(spec, evaluate_sum_revenue(spec, subset, cats)).status
+                r = (
+                    _with_quarters(lambda f: evaluate_sum_revenue(spec, f, cats), subset)
+                    if qred
+                    else evaluate_sum_revenue(spec, subset, cats)
+                )
+                return apply_springing(spec, r, trigger_value=_springing_trigger(subset, cats)).status
 
             return res, None, recompute
         if spec.covenant_type == "sum_related_party_payments":
             if kyc_facts is None:
                 return None, "related-party covenant missing KYC dossier; stubbed", None
-            if kyc_facts.related_party_threshold_pct is None:
-                return None, "KYC threshold missing; related-party covenant not evaluated from dossier; stubbed", None
+            # threshold_pct may be None — dossier-labelled affiliates still evaluate.
             res = evaluate_sum_related_party_payments(
                 spec, frame, kyc_facts.counterparties, kyc_facts.related_party_threshold_pct, categories
             )
@@ -1577,28 +1752,70 @@ def _evaluate_and_flip(
                     evaluate_sum_related_party_payments(
                         spec, subset, kyc_facts.counterparties, kyc_facts.related_party_threshold_pct, cats
                     ),
+                    trigger_value=_springing_trigger(subset, cats),
                 ).status
 
             return res, None, recompute
         if spec.covenant_type == "sum_category":
-            res = evaluate_sum_category(
-                spec, frame, categories, off_ledger=off_ledger, materiality_threshold_usd=materiality
-            )
+            if getattr(spec, "pct_of_group_capex", False):
+                if group_capex_value is None:
+                    return None, "pct_of_group_capex missing group capex; stubbed", None
+                res = evaluate_sum_categories_vs_group_pct(
+                    spec, frame, categories, group_capex_value
+                )
+
+                def recompute(subset, cats):
+                    return apply_springing(
+                        spec,
+                        evaluate_sum_categories_vs_group_pct(spec, subset, cats, group_capex_value),
+                        trigger_value=_springing_trigger(subset, cats),
+                    ).status
+
+                return res, None, recompute
+
+            def _sum(frm):
+                return evaluate_sum_category(
+                    spec, frm, categories, off_ledger=off_ledger, materiality_threshold_usd=materiality
+                )
+
+            res = _with_quarters(_sum, frame) if qred else _sum(frame)
 
             def recompute(subset, cats):
-                return apply_springing(
-                    spec,
-                    evaluate_sum_category(
+                r = (
+                    _with_quarters(
+                        lambda f: evaluate_sum_category(
+                            spec, f, cats, off_ledger=off_ledger, materiality_threshold_usd=materiality
+                        ),
+                        subset,
+                    )
+                    if qred
+                    else evaluate_sum_category(
                         spec, subset, cats, off_ledger=off_ledger, materiality_threshold_usd=materiality
-                    ),
-                ).status
+                    )
+                )
+                return apply_springing(spec, r, trigger_value=_springing_trigger(subset, cats)).status
 
             return res, None, recompute
         if spec.covenant_type == "max_category":
+            if bucket:
+                def _bmax(frm):
+                    # max over quarters of bucket sum — if qred=max; else single sum vs thr
+                    return evaluate_description_bucket(spec, frm, bucket)
+
+                res = _with_quarters(_bmax, frame) if qred else _bmax(frame)
+
+                def recompute(subset, cats):
+                    r = _with_quarters(lambda f: evaluate_description_bucket(spec, f, bucket), subset) if qred else evaluate_description_bucket(spec, subset, bucket)
+                    return apply_springing(spec, r, trigger_value=_springing_trigger(subset, cats)).status
+
+                return res, None, recompute
             res = evaluate_max_category(spec, frame, categories)
 
             def recompute(subset, cats):
-                return apply_springing(spec, evaluate_max_category(spec, subset, cats)).status
+                return apply_springing(
+                    spec, evaluate_max_category(spec, subset, cats),
+                    trigger_value=_springing_trigger(subset, cats),
+                ).status
 
             return res, None, recompute
         if spec.covenant_type == "revenue_minus_max_category":
@@ -1608,13 +1825,77 @@ def _evaluate_and_flip(
                 return apply_springing(
                     spec,
                     evaluate_revenue_minus_max_category(spec, subset, cats, off_ledger=off_ledger),
+                    trigger_value=_springing_trigger(subset, cats),
                 ).status
 
             return res, None, recompute
         if spec.covenant_type == "ratio_generic":
-            res = evaluate_ratio_generic(
-                spec, frame, categories, materiality_threshold_usd=materiality
-            )
+            if getattr(spec, "ebitda_plus_categories", None):
+                res = evaluate_ebitda_plus_categories(
+                    spec, frame, categories, materiality_threshold_usd=materiality
+                )
+
+                def recompute(subset, cats):
+                    return apply_springing(
+                        spec,
+                        evaluate_ebitda_plus_categories(
+                            spec, subset, cats, materiality_threshold_usd=materiality
+                        ),
+                        trigger_value=_springing_trigger(subset, cats),
+                    ).status
+
+                return res, None, recompute
+
+            def _rg(frm):
+                return evaluate_ratio_generic(
+                    spec, frm, categories, materiality_threshold_usd=materiality
+                )
+
+            # Quarterly EBITDA floor: rebuild value_raw as ebitda per quarter.
+            if qred and "ebitda" in f"{spec.quote or ''} {spec.formula_description or ''}".casefold():
+                from agent.s4_engine import CovenantResult, verdict as _verdict
+                from agent.schemas import EBITDA_OPEX_CATEGORIES
+                from agent.s4_engine import _sum_cats
+
+                def _ebitda_metric(qdf):
+                    rev_raw, rev_ids = _sum_cats(qdf, categories, ["revenue"])
+                    opex_raw, opex_ids = _sum_cats(qdf, categories, list(EBITDA_OPEX_CATEGORIES))
+                    ebitda = float(rev_raw) - abs(float(opex_raw))
+                    return ebitda, rev_ids + opex_ids, []
+
+                val, ids, qflags = reduce_over_calendar_quarters(
+                    frame, spec.period_start, spec.period_end, qred, _ebitda_metric
+                )
+                status = _verdict(val, spec.comparator, spec.threshold)
+                res = CovenantResult(
+                    clause=spec.clause,
+                    status=status,
+                    actual=round(abs(val), 2) if val != 0 else 0.01,
+                    contributing_txn_ids=ids,
+                    flags=["quarterly_ebitda"] + qflags,
+                    inputs={"value_raw": val, "total": abs(val), "numerator": abs(val), "ebitda": val},
+                )
+
+                def recompute(subset, cats):
+                    def _m(qdf):
+                        rev_raw, rev_ids = _sum_cats(qdf, cats, ["revenue"])
+                        opex_raw, opex_ids = _sum_cats(qdf, cats, list(EBITDA_OPEX_CATEGORIES))
+                        ebitda = float(rev_raw) - abs(float(opex_raw))
+                        return ebitda, rev_ids + opex_ids, []
+
+                    v, _i, _f = reduce_over_calendar_quarters(
+                        subset, spec.period_start, spec.period_end, qred, _m
+                    )
+                    st = _verdict(v, spec.comparator, spec.threshold)
+                    return apply_springing(
+                        spec,
+                        CovenantResult(clause=spec.clause, status=st, actual=abs(v), contributing_txn_ids=[], flags=[], inputs={"value_raw": v}),
+                        trigger_value=_springing_trigger(subset, cats),
+                    ).status
+
+                return res, None, recompute
+
+            res = _rg(frame)
 
             def recompute(subset, cats):
                 return apply_springing(
@@ -1622,10 +1903,21 @@ def _evaluate_and_flip(
                     evaluate_ratio_generic(
                         spec, subset, cats, materiality_threshold_usd=materiality
                     ),
+                    trigger_value=_springing_trigger(subset, cats),
                 ).status
 
             return res, None, recompute
         if spec.covenant_type == "unknown":
+            if bucket:
+                res = evaluate_description_bucket(spec, frame, bucket)
+
+                def recompute(subset, cats):
+                    return apply_springing(
+                        spec, evaluate_description_bucket(spec, subset, bucket),
+                        trigger_value=_springing_trigger(subset, cats),
+                    ).status
+
+                return res, None, recompute
             return None, (
                 f"unknown covenant_type; formula={spec.formula_description!r}; "
                 f"quote={(spec.quote or '')[:160]!r}; stubbed — update S4"
@@ -1633,11 +1925,17 @@ def _evaluate_and_flip(
         return None, f"unknown covenant_type {spec.covenant_type}", None
 
     def _tree_eval(frame, tree_spec: CovenantSpec):
-        res = apply_springing(spec, evaluate_expr(tree_spec, frame, categories, expr_ctx))
+        res = apply_springing(
+            spec,
+            evaluate_expr(tree_spec, frame, categories, expr_ctx),
+            trigger_value=_springing_trigger(frame, categories),
+        )
 
         def recompute(subset, cats):
             return apply_springing(
-                spec, evaluate_expr(tree_spec, subset, cats, expr_ctx)
+                spec,
+                evaluate_expr(tree_spec, subset, cats, expr_ctx),
+                trigger_value=_springing_trigger(subset, cats),
             ).status
 
         return res, recompute
@@ -1675,7 +1973,9 @@ def _evaluate_and_flip(
         return stub, [stub_reason], build_cell_trace(stub, spec=spec, stub_reason=stub_reason, clause_flags=[stub_reason])
 
     assert enum_result is not None and enum_recompute is not None
-    enum_result = apply_springing(spec, enum_result)
+    enum_result = apply_springing(
+        spec, enum_result, trigger_value=_springing_trigger(period_df, categories)
+    )
     # W3.8 / V4 §6: cell computed → SPEC_INCOMPLETE is soft noise only (never critical).
     if incomplete:
         flags = [f for f in flags if not str(f).startswith("SPEC_INCOMPLETE")]
@@ -1684,7 +1984,7 @@ def _evaluate_and_flip(
     if excluded_ids:
         raw_result, raw_reason, _ = _enum_eval(period_raw)
         if raw_result is not None and not raw_reason:
-            raw_result = apply_springing(spec, raw_result)
+            raw_result = apply_springing(spec, raw_result, trigger_value=_springing_trigger(period_raw, categories))
             flip = carve_out_status_flip_flag(
                 raw_result.status, enum_result.status, excluded_ids, excluded_abs
             )

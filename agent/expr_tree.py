@@ -279,6 +279,22 @@ def synthesize_expr_from_enum(spec: CovenantSpec) -> CovenantSpec | None:
 
     Dual-path with s4 evaluate_*: when changing a formula, update both.
     """
+    # Tier-1 shapes that the flat tree cannot express — stay on enum path.
+    if getattr(spec, "description_bucket", None):
+        return None
+    if getattr(spec, "pct_of_group_capex", False):
+        return None
+    if getattr(spec, "quarter_reduce", None):
+        return None
+    if getattr(spec, "springing_mode", None) in {
+        "own_capex_above",
+        "trigger_above",
+        "min_quarter_revenue_below",
+        "leverage_above",
+    }:
+        return None
+    if getattr(spec, "ebitda_plus_categories", None):
+        return None
     nodes: list[ExprNode] = []
     nxt = 0
 
@@ -376,6 +392,11 @@ def synthesize_expr_from_enum(spec: CovenantSpec) -> CovenantSpec | None:
             den = add("agg", categories=den_cats, sign="abs")
             root = add("div", children=[num, den])
     elif t == "ratio_group_capex_to_ebitda":
+        from agent.s4_engine import is_absolute_group_capex_ceiling
+
+        # Absolute Group-capex ceilings (incl. outside-borrower) stay on the enum path.
+        if is_absolute_group_capex_ceiling(spec):
+            return None
         g = add("group_capex")
         rev = add("agg", categories=["revenue"], sign="signed")
         opex = add("agg", categories=list(EBITDA_OPEX_CATEGORIES), sign="abs")

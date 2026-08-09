@@ -54,6 +54,7 @@ revenue | operating_expense | payroll | utilities | rent | taxes | insurance |
 interest_expense | financing_proceeds | capex | financing | unrestricted_subsidiary_transfer | other.
 Use fine categories when the clause names them (payroll/«оплата труда», utilities/«коммунальн», rent/«аренд», taxes/«налог», insurance/«страхо», interest, financing proceeds/«поступления по финансированию», transfers to unrestricted subsidiaries/«Неограниченн»). Prefer list fields numerator_categories / denominator_categories / filter_categories when several articles appear; leave the singular *_category null then.
 NEVER put "other" in numerator_categories, denominator_categories, or filter_categories — "other" is a residual ledger label, not a covenant formula article. If the clause cannot be expressed with the vocabulary above, use covenant_type="unknown" + formula_description.
+For marketing / «Маркетинговые расходы» or consulting / «Консультационные» expense covenants: put the verbatim article name in formula_description and quote the full definition paragraph (not a truncated «такие совокупные расходы» pointer); leave filter_categories empty rather than stuffing "other".
 
 CRITICAL — pick covenant_type in this order (do NOT skip to a generic shape when a specific one matches):
 1. Clause about Group capital expenditure / «капитальные затраты Группы» relative to borrower's EBITDA / «EBITDA Заёмщика» → MUST be "ratio_group_capex_to_ebitda" (never "ratio_generic").
