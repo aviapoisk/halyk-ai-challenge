@@ -118,24 +118,16 @@ def flip_test(
     )
 
     if len(flippers) == 1:
-        # W2.9: when mechanism pool is non-empty, contribution-only outsiders are not
-        # evidence (open GT: single-capex BREACH → null). Empty pool + unique flipper
-        # → accept (private-set cells with no auditor/doc mechanism).
-        if mechanism and flippers[0] not in mech_set:
+        # Mechanism pool is preference (tried first above), not a hard veto on a unique
+        # contributor flipper. Multi-flipper arbitration still uses the pool.
+        if not mechanism:
+            note = "single flipper (empty mechanism pool)"
+        elif flippers[0] not in mech_set:
             note = (
-                f"flip-test: single contributor flipper {flippers[0]} "
-                "outside mechanism pool — evidence null"
+                f"single flipper {flippers[0]} outside mechanism pool — accepted"
             )
-            return (
-                None,
-                [note],
-                {
-                    "flippers": flippers,
-                    "doc_named_candidates": doc_named,
-                    "mechanism_candidates": mechanism,
-                    "note": note,
-                },
-            )
+        else:
+            note = "single flipper"
         return (
             flippers[0],
             [],
@@ -143,11 +135,7 @@ def flip_test(
                 "flippers": flippers,
                 "doc_named_candidates": doc_named,
                 "mechanism_candidates": mechanism,
-                "note": (
-                    "single flipper (empty mechanism pool)"
-                    if not mechanism
-                    else "single flipper"
-                ),
+                "note": note,
             },
         )
     if len(flippers) == 0:

@@ -98,6 +98,78 @@ def test_merge_skips_draft_scrape_when_authoritative_denies():
     assert "TXN-ZZ-0044" in note_named
 
 
+def test_denial_drops_llm_category_move_on_authoritative_doc():
+    """Denial must strip LLM reclassify rows (null to_category) — P6 regression."""
+    auth = (
+        _AUTH_NOTES
+        + "Операция TXN-P6-0044, первоначально учтённая как Коммунальные услуги "
+        "($418,204.37), переклассифицирована для целей соблюдения ковенантов как Налоги.\n"
+        "Основание: вопрос поставлен на промежуточном этапе.\n"
+    )
+    docs = [_doc("auth", auth)]
+    facts = [
+        AuditorNotesFacts(
+            borrower_name="Taraz Cement Works JSC",
+            reclassifications_present=True,
+            reclassification_notes=["Переклассификаций за ковенантный период не требовалось."],
+            reclassifications=[
+                Reclassification(
+                    action="reclassify",
+                    txn_id="TXN-P6-0044",
+                    amount=418204.37,
+                    to_category=None,
+                    quote=(
+                        "Предварительные вопросы по классификации операций\n"
+                        "(4.1) Операция TXN-P6-0044, первоначально учтённая как Коммунальные "
+                        "услуги ($418,204.37), переклассифицирована как Налоги. "
+                        "Основание: вопрос поставлен на промежуточном этапе."
+                    ),
+                )
+            ],
+        ),
+    ]
+    _merged, reclass, _off, _doc_id, flags, _note = _merge_auditor_facts(docs, facts)
+    assert not any(str(r.txn_id) == "TXN-P6-0044" for r in reclass)
+    assert any("denial" in f and "dropped" in f for f in flags) or any(
+        "preliminary" in f for f in flags
+    )
+
+
+def test_preliminary_reclass_skipped_without_denial():
+    """Draft-style preliminary reclass must not enter applied list (B1)."""
+    from agent.s4_engine import apply_reclassifications, is_preliminary_reclass_quote
+
+    quote = (
+        "Предварительные вопросы по классификации операций\n"
+        "(4.1) Операция TXN-B1-0023, первоначально учтённая как Операционные расходы "
+        "($6,166,592.66), переклассифицирована как Коммунальные услуги. "
+        "Основание: вопрос поставлен на промежуточном этапе."
+    )
+    assert is_preliminary_reclass_quote(quote)
+    df = pd.DataFrame(
+        {
+            "txn_id": ["TXN-B1-0023"],
+            "amount": [-6_166_592.66],
+            "description": ["Plant operating and maintenance expenses"],
+            "counterparty": ["Pavlodar Plant Services LLP"],
+        }
+    )
+    cats = {"TXN-B1-0023": "operating_expense"}
+    recs = [
+        Reclassification(
+            action="reclassify",
+            txn_id="TXN-B1-0023",
+            amount=6_166_592.66,
+            to_category="utilities",
+            quote=quote,
+        )
+    ]
+    new_cats, _out, flags, applied, _ = apply_reclassifications(cats, df, recs)
+    assert new_cats["TXN-B1-0023"] == "operating_expense"
+    assert applied == []
+    assert any("preliminary" in f for f in flags)
+
+
 def test_infer_to_category_rashody_na_oplatu_truda():
     q = (
         "Операция TXN-ZZ-0016, первоначально учтённая как Консультационные услуги "

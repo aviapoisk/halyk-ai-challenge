@@ -28,11 +28,11 @@ cp .env.example .env
 `AGENT_BASE_URL` для локального endpoint).
 
 ```bash
-R=results/submission2
+R=results/submission3
 uv run python -m agent.run \
   --dataset data/agentic-bank-hidden \
   --out $R/submission.json \
-  --cache .cache/submission2 \
+  --cache .cache/submission3 \
   --engine tree \
   --dev
 ```

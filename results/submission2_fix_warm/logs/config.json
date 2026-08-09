@@ -1,0 +1,19 @@
+{
+  "cache_dir": ".cache/submission2",
+  "dataset_dir": "data/agentic-bank-public",
+  "dev": true,
+  "engine": "tree",
+  "git_sha": "29667629458c73efa3b349d251e242a4690f0534",
+  "llm_adaptive_thinking": false,
+  "llm_concurrency": 24,
+  "llm_effort": "high",
+  "model_name": "claude-sonnet-5",
+  "model_provider": "anthropic",
+  "only_scenario": null,
+  "out_path": "results/submission2_fix_warm/submission.json",
+  "profile": "default",
+  "seed": 42,
+  "self_consistency": true,
+  "use_cache": true,
+  "vision_char_threshold": 50
+}

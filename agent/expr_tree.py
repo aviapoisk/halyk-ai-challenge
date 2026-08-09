@@ -16,11 +16,18 @@ from agent.s4_engine import (
     _amount_col,
     _cat_list,
     _currency_mix,
+    _money_minus_tokens,
     _off_ledger_sum,
     _one_off_addbacks,
     _related_party_names,
     _restricted_transfer_den_extra,
     _sum_cats,
+    looks_like_dscr,
+    looks_like_ebitda_over_opex_lines,
+    looks_like_money_linear_metric,
+    looks_like_net_debt,
+    looks_like_ratio_language,
+    looks_like_total_debt_leverage,
     related_party_match_mask,
     snapshot_as_of,
     verdict,
@@ -223,9 +230,10 @@ def evaluate_expr(
             contrib.extend(ids)
             return val
         if node.op == "related_outflows":
-            if not ctx.related_parties or ctx.related_threshold_pct is None:
+            if not ctx.related_parties:
                 flags.append("expr related_outflows missing KYC")
                 return 0.0
+            # Null thr% → explicit affiliates only (same as enum _related_party_names).
             names = _related_party_names(ctx.related_parties, ctx.related_threshold_pct)
             mask, mflags = related_party_match_mask(period_df, names)
             flags.extend(mflags)
@@ -291,9 +299,13 @@ def synthesize_expr_from_enum(spec: CovenantSpec) -> CovenantSpec | None:
         "trigger_above",
         "min_quarter_revenue_below",
         "leverage_above",
+        "payroll_ratio_above",
     }:
         return None
     if getattr(spec, "ebitda_plus_categories", None):
+        return None
+    quote0 = f"{spec.quote or ''} {spec.formula_description or ''}".casefold()
+    if looks_like_dscr(quote0):
         return None
     nodes: list[ExprNode] = []
     nxt = 0
@@ -340,10 +352,46 @@ def synthesize_expr_from_enum(spec: CovenantSpec) -> CovenantSpec | None:
         den_cats = [c for c in den_cats if c != "other"]
         num_cats = [c for c in num_cats if c != "other"]
 
+        # Absolute $ metrics: synthesize sum / sub, not div (tree engine prefers this path).
+        thr = float(spec.threshold)
+        if looks_like_money_linear_metric(quote, thr):
+            minus = _money_minus_tokens(quote)
+            true_ebitda_ratio = has_ebitda and not minus and (
+                "долг" in quote
+                or "debt" in quote
+                or "leverage" in quote
+                or "покрытия" in quote
+                or "coverage" in quote
+                or "марж" in quote
+                or "/ ebitda" in quote
+                or "/ebitda" in quote
+                or "к ebitda" in quote
+            )
+            if not true_ebitda_ratio:
+                if minus and num_cats and den_cats:
+                    left_cats, right_cats = list(num_cats), list(den_cats)
+                    if "revenue" in right_cats and "capex" in left_cats:
+                        left_cats, right_cats = right_cats, left_cats
+                    elif (
+                        "financing_proceeds" in right_cats
+                        and any(c in left_cats for c in ("interest_expense", "taxes"))
+                    ):
+                        left_cats, right_cats = right_cats, left_cats
+                    left = add("agg", categories=left_cats, sign="abs")
+                    right = add("agg", categories=right_cats, sign="abs")
+                    root = add("sub", children=[left, right])
+                    return spec.model_copy(update={"expr_nodes": nodes, "expr_root": root})
+                filt = _cat_list(spec.filter_categories, spec.filter_category) or []
+                sum_cats = num_cats or filt or (den_cats if not has_ebitda else [])
+                if sum_cats and (not den_cats or not num_cats or not looks_like_ratio_language(quote)):
+                    root = add("agg", categories=sum_cats if num_cats or filt else den_cats, sign="abs")
+                    return spec.model_copy(update={"expr_nodes": nodes, "expr_root": root})
+
         # Explicit category dens that are not EBITDA-shape (capex, transfers, …) win over
         # incidental "EBITDA" tokens in formula_description disclaimers
         # («not Group capex to Borrower EBITDA»).
-        ebitda_shape_den = not den_cats or set(den_cats) <= {"interest_expense", "revenue"}
+        _ebitda_den_ok = {"interest_expense", "revenue", "financing", "rent", "utilities", "insurance"}
+        ebitda_shape_den = not den_cats or set(den_cats) <= _ebitda_den_ok
         use_ebitda = has_ebitda and ebitda_shape_den
 
         # EBITDA (incl. Adjusted) → sub(revenue, operating_expense), never abs-sum of cats.
@@ -353,21 +401,49 @@ def synthesize_expr_from_enum(spec: CovenantSpec) -> CovenantSpec | None:
             ebitda = add("sub", children=[rev, opex])
             adj = "скорректирован" in quote or "adjusted ebitda" in quote
             interest_den = den_cats == ["interest_expense"] or set(den_cats) == {"interest_expense"}
-            icr = (
-                "покрытия процентов" in quote
-                or "покрытие процентов" in quote
-                or "interest coverage" in quote
-                or (not num_cats and interest_den)
+            dscr = looks_like_dscr(quote) or (
+                not num_cats and set(den_cats or []) == {"interest_expense", "financing"}
             )
-            if icr or interest_den:
+            opex_line_den = bool(den_cats) and set(den_cats) <= {"rent", "utilities", "insurance"}
+            icr = (
+                not dscr
+                and (
+                    "покрытия процентов" in quote
+                    or "покрытие процентов" in quote
+                    or "interest coverage" in quote
+                    or (not num_cats and interest_den)
+                )
+            )
+            if dscr:
+                den_ds = add("agg", categories=["interest_expense", "financing"], sign="abs")
+                root = add("div", children=[ebitda, den_ds])
+            elif icr or interest_den:
                 den_int = add("agg", categories=["interest_expense"], sign="abs")
                 root = add("div", children=[ebitda, den_int])
+            elif (opex_line_den or looks_like_ebitda_over_opex_lines(quote)) and not num_cats:
+                dens = den_cats or ["rent", "utilities", "insurance"]
+                den_op = add("agg", categories=list(dens), sign="abs")
+                root = add("div", children=[ebitda, den_op])
+            elif looks_like_net_debt(quote) or (
+                num_cats and set(num_cats) == {"financing_proceeds", "financing"}
+            ):
+                drawn = add("agg", categories=["financing_proceeds"], sign="abs")
+                repay = add("agg", categories=["financing"], sign="abs")
+                net = add("sub", children=[drawn, repay])
+                root = add("div", children=[net, ebitda])
+            elif looks_like_total_debt_leverage(quote) and (
+                not num_cats or num_cats == ["financing_proceeds"]
+            ):
+                num = add("agg", categories=["financing_proceeds"], sign="abs")
+                root = add("div", children=[num, ebitda])
             # Adj. EBITDA / Revenue (or EBITDA / Revenue).
             elif adj or (
                 "выручк" in quote
                 and ("ebitda" in quote)
                 and not num_cats
                 and (not den_cats or den_cats == ["revenue"])
+                and not looks_like_total_debt_leverage(quote)
+                and not looks_like_dscr(quote)
             ):
                 den_rev = add("agg", categories=["revenue"], sign="abs")
                 root = add("div", children=[ebitda, den_rev])

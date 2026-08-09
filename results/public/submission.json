@@ -7,7 +7,7 @@
       "6.1": {
         "status": "BREACH",
         "actual": 0.46,
-        "evidence_txn_id": null
+        "evidence_txn_id": "TXN-P1-0010"
       },
       "6.2": {
         "status": "BREACH",
@@ -24,12 +24,12 @@
       "6.1": {
         "status": "BREACH",
         "actual": 0.44,
-        "evidence_txn_id": null
+        "evidence_txn_id": "TXN-P2-0034"
       },
       "6.2": {
         "status": "BREACH",
         "actual": 3204881.55,
-        "evidence_txn_id": null
+        "evidence_txn_id": "TXN-P2-0036"
       },
       "6.3": {
         "status": "BREACH",
@@ -96,7 +96,7 @@
       },
       "6.2": {
         "status": "COMPLIANT",
-        "actual": 3.64,
+        "actual": 4.67,
         "evidence_txn_id": null
       },
       "6.3": {
@@ -177,7 +177,7 @@
       "6.1": {
         "status": "BREACH",
         "actual": 1.68,
-        "evidence_txn_id": "TXN-B1-0020"
+        "evidence_txn_id": null
       },
       "6.2": {
         "status": "COMPLIANT",

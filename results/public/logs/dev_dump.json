@@ -116,6 +116,16 @@
        "status": "applied",
        "to_category": "interest_expense",
        "txn_id": null
+      },
+      {
+       "action": "reclassify",
+       "amount": 6166592.66,
+       "counterparty": null,
+       "from_category": null,
+       "quote": "и иных лиц.\n4. Предварительные вопросы по классификации операций\n(4.1) Операция TXN-B1-0023, первоначально учтённая как Операционные расходы\n($6,166,592.66), переклассифицирована для целей соблюдения ковенантов как Коммунальные\nуслуги.\nОснование: вопрос поставлен на промежуточном этапе по подтверждающим документам",
+       "status": "applied",
+       "to_category": null,
+       "txn_id": "TXN-B1-0023"
       }
      ],
      "reclassifications_present": true,
@@ -6367,7 +6377,18 @@
      "reclassification_notes": [
       "Переклассификаций за ковенантный период не требовалось."
      ],
-     "reclassifications": [],
+     "reclassifications": [
+      {
+       "action": "reclassify",
+       "amount": 264117.82,
+       "counterparty": null,
+       "from_category": null,
+       "quote": "и иных лиц.\n4. Предварительные вопросы по классификации операций\n(4.1) Операция TXN-P3-0001, первоначально учтённая как Консультационные услуги\n($264,117.82), переклассифицирована для целей соблюдения ковенантов как Операционные\nрасходы.\nОснование: вопрос поставлен на промежуточном этапе по подтверждающим документа",
+       "status": "applied",
+       "to_category": null,
+       "txn_id": "TXN-P3-0001"
+      }
+     ],
      "reclassifications_present": false,
      "usd_amount": 83690.23
     },
@@ -9735,7 +9756,18 @@
      "reclassification_notes": [
       "Переклассификаций за ковенантный период не требовалось."
      ],
-     "reclassifications": [],
+     "reclassifications": [
+      {
+       "action": "reclassify",
+       "amount": 418204.37,
+       "counterparty": null,
+       "from_category": null,
+       "quote": "и иных лиц.\n4. Предварительные вопросы по классификации операций\n(4.1) Операция TXN-P6-0044, первоначально учтённая как Коммунальные услуги ($418,204.37),\nпереклассифицирована для целей соблюдения ковенантов как Налоги.\nОснование: вопрос поставлен на промежуточном этапе по подтверждающим документам к\nпроводке; ",
+       "status": "applied",
+       "to_category": null,
+       "txn_id": "TXN-P6-0044"
+      }
+     ],
      "reclassifications_present": false,
      "usd_amount": null
     },
@@ -10115,7 +10147,7 @@
        "filter_categories": [
         "capex"
        ],
-       "filter_category": null,
+       "filter_category": "capex",
        "formula_description": "",
        "numerator_categories": [],
        "numerator_category": null,
@@ -10705,7 +10737,7 @@
     {
      "amount": -418204.37,
      "amount_usd": -418204.37,
-     "category": "utilities",
+     "category": "taxes",
      "counterparty": "Zhambyl Energy Supply JSC",
      "currency": "USD",
      "date": "2025-11-25",
@@ -12081,6 +12113,16 @@
        "status": "applied",
        "to_category": "payroll",
        "txn_id": "TXN-P8-0031"
+      },
+      {
+       "action": "reclassify",
+       "amount": 342118.65,
+       "counterparty": null,
+       "from_category": null,
+       "quote": "и иных лиц.\n4. Предварительные вопросы по классификации операций\n(4.1) Операция TXN-P8-0016, первоначально учтённая как Консультационные услуги\n($342,118.65), переклассифицирована для целей соблюдения ковенантов как Расходы на оплату\nтруда.\nОснование: вопрос поставлен на промежуточном этапе по подтверждающим докуме",
+       "status": "applied",
+       "to_category": null,
+       "txn_id": "TXN-P8-0016"
       }
      ],
      "reclassifications_present": true,
@@ -12427,7 +12469,7 @@
        "filter_categories": [
         "capex"
        ],
-       "filter_category": null,
+       "filter_category": "capex",
        "formula_description": "",
        "numerator_categories": [],
        "numerator_category": null,
@@ -13160,7 +13202,18 @@
      "reclassification_notes": [
       "Переклассификаций за ковенантный период не требовалось."
      ],
-     "reclassifications": [],
+     "reclassifications": [
+      {
+       "action": "reclassify",
+       "amount": 418204.37,
+       "counterparty": null,
+       "from_category": null,
+       "quote": "и иных лиц.\n4. Предварительные вопросы по классификации операций\n(4.1) Операция TXN-P9-0025, первоначально учтённая как Капитальные затраты ($418,204.37),\nпереклассифицирована для целей соблюдения ковенантов как Расходы на оплату труда.\nОснование: вопрос поставлен на промежуточном этапе по подтверждающим докуме",
+       "status": "applied",
+       "to_category": null,
+       "txn_id": "TXN-P9-0025"
+      }
+     ],
      "reclassifications_present": false,
      "usd_amount": null
     },

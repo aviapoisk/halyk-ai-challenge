@@ -91,7 +91,17 @@ def _row_matches(co: CarveOut, row: pd.Series, categories: dict[str, str]) -> bo
             if any(t in needle for t in ("market", "маркетинг", "реклам", "advertis")):
                 return any(
                     t in desc or t in cp
-                    for t in ("marketing", "advertis", "маркетинг", "реклам")
+                    for t in (
+                        "marketing",
+                        "advertis",
+                        "маркетинг",
+                        "реклам",
+                        "billboard",
+                        "ad campaign",
+                        "outdoor",
+                        "promo",
+                        "media buy",
+                    )
                 )
             return needle in desc or needle in cp
         return categories.get(tid) == want
@@ -133,6 +143,7 @@ def apply_carve_outs(
         return period_df, [], flags
 
     exclude_mask = pd.Series(False, index=period_df.index)
+    col = "amount_usd" if "amount_usd" in period_df.columns else "amount"
     for co in spec.carve_outs:
         # Restricted-subsidiary carve-outs are applied via pledge category remap
         # (numerator-only); excluding the counterparty from period_df would also
@@ -147,12 +158,39 @@ def apply_carve_outs(
         matched = period_df.apply(lambda r, c=co: _row_matches(c, r, categories), axis=1)
         if not bool(matched.any()):
             flags.append(f"CARVEOUT_MATCHED_NOTHING kind={co.kind} value={co.value!r}")
-        exclude_mask = exclude_mask | matched
+            continue
+        # Basket with monetary cap: exclude smallest matching rows until cum <= amount.
+        # amount_below already filters per-row in _row_matches — do not double-cap.
+        if co.amount is not None and co.kind != "amount_below":
+            cap = abs(float(co.amount))
+            cand = period_df.loc[matched].copy()
+            cand["_abs"] = cand[col].abs()
+            cand = cand.sort_values(by=["_abs", "txn_id"], kind="mergesort")
+            running = 0.0
+            take_idx: list = []
+            for idx, row in cand.iterrows():
+                amt = float(row["_abs"])
+                if running + amt > cap + 1e-9:
+                    break
+                running += amt
+                take_idx.append(idx)
+            if take_idx:
+                exclude_mask.loc[take_idx] = True
+                flags.append(
+                    f"carve_out_basket_cap amount={cap} taken_n={len(take_idx)} "
+                    f"taken_sum={running:.2f} matched_n={int(matched.sum())}"
+                )
+            else:
+                flags.append(
+                    f"carve_out_basket_cap amount={cap} taken_n=0 "
+                    f"(smallest row exceeds cap) matched_n={int(matched.sum())}"
+                )
+        else:
+            exclude_mask = exclude_mask | matched
 
     excluded = period_df.loc[exclude_mask]
     excluded_ids = sorted(excluded["txn_id"].astype(str).tolist()) if not excluded.empty else []
     if excluded_ids:
-        col = "amount_usd" if "amount_usd" in excluded.columns else "amount"
         excl_sum = float(excluded[col].abs().sum()) if col in excluded.columns else 0.0
         flags.append(f"carve_out_excluded n={len(excluded_ids)} abs_sum={excl_sum:.2f}")
     kept = period_df.loc[~exclude_mask].copy()

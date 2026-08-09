@@ -196,6 +196,55 @@ def test_recategorize_filled_tax_row():
     assert any("taxes" in f for f in flags)
 
 
+def test_fill_negates_despite_state_revenue_committee_name():
+    """Bare «revenue» in counterparty must not block expense sign (P7)."""
+    df = pd.DataFrame(
+        {
+            "txn_id": ["TXN-P7-0033"],
+            "amount": [float("nan")],
+            "description": ["Mineral extraction tax assessment 2025"],
+            "counterparty": ["State Revenue Committee"],
+        }
+    )
+    recs = [
+        Reclassification(
+            action="include_in_period",
+            txn_id="TXN-P7-0033",
+            amount=486_204.19,
+            to_category="taxes",
+            quote=(
+                "Операция TXN-P7-0033 (State Revenue Committee): сумма не отражена "
+                "в выгрузке реестра; фактическая сумма операции составляет $486,204.19 (расход)."
+            ),
+        )
+    ]
+    filled, _ = fill_missing_amounts_from_reclassifications(df, recs)
+    assert filled.loc[0, "amount"] == -486_204.19
+
+
+def test_refine_keeps_revenue_financing_coverage_not_capex_revenue():
+    """P2-style coverage ratio must not be rewritten to capex/revenue."""
+    quote = (
+        "Отношение суммы выручки и поступлений по финансированию Заёмщика "
+        "(Almaty Cold Chain JSC) к сумме операционных и капитальных затрат "
+        "за период с 2025-01-01 по 2025-12-31 должно составлять не менее 1.20x."
+    )
+    spec = CovenantSpec(
+        clause="6.1",
+        covenant_type="ratio_generic",
+        comparator="min",
+        threshold=1.2,
+        period_start="2025-01-01",
+        period_end="2025-12-31",
+        quote=quote,
+        numerator_categories=["revenue", "financing_proceeds"],
+        denominator_categories=["operating_expense", "capex"],
+    )
+    out = refine_covenant_spec(spec)
+    assert out.numerator_categories == ["revenue", "financing_proceeds"]
+    assert out.denominator_categories == ["operating_expense", "capex"]
+
+
 def test_pledge_remaps_restricted_transfer():
     df = pd.DataFrame(
         {

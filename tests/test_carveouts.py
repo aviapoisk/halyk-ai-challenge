@@ -114,3 +114,60 @@ def test_carve_out_quote_not_in_document_dropped():
 def test_carveout_suspected_when_hint_without_list():
     spec = _spec(carve_outs=[], quote="лимит capex за исключением связанных сторон")
     assert suspect_carve_outs(spec) == ["CARVEOUT_SUSPECTED"]
+
+
+def test_carve_out_category_respects_amount_cap():
+    """Basket «до $300k consulting» must not wipe multi-million consulting rows."""
+    df = _df(
+        [
+            {
+                "txn_id": "TXN-B-1",
+                "date": "2025-03-01",
+                "account_id": "ACC-1",
+                "counterparty": "Advisor LLP",
+                "description": "consulting services Q1",
+                "amount": -50_000.0,
+                "currency": "USD",
+                "amount_usd": -50_000.0,
+            },
+            {
+                "txn_id": "TXN-B-2",
+                "date": "2025-06-01",
+                "account_id": "ACC-1",
+                "counterparty": "BigConsult JSC",
+                "description": "consulting project",
+                "amount": -400_000.0,
+                "currency": "USD",
+                "amount_usd": -400_000.0,
+            },
+            {
+                "txn_id": "TXN-B-3",
+                "date": "2025-09-01",
+                "account_id": "ACC-1",
+                "counterparty": "Other JSC",
+                "description": "capex plant",
+                "amount": -100_000.0,
+                "currency": "USD",
+                "amount_usd": -100_000.0,
+            },
+        ]
+    )
+    cats = {"TXN-B-1": "other", "TXN-B-2": "other", "TXN-B-3": "capex"}
+    quote = "до $300 000 платежей, надлежащим образом квалифицированных как Консультационные услуги"
+    spec = _spec(
+        carve_outs=[
+            CarveOut(
+                kind="category",
+                value="Консультационные услуги",
+                amount=300_000.0,
+                quote=quote,
+            )
+        ],
+        quote=quote,
+        filter_category="other",
+        threshold=200_000.0,
+    )
+    filtered, excluded, flags = apply_carve_outs(spec, df, cats)
+    assert excluded == ["TXN-B-1"]  # only the 50k fits under 300k before 400k exceeds
+    assert "TXN-B-2" not in excluded
+    assert any("carve_out_basket_cap" in f for f in flags)

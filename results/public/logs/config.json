@@ -3,7 +3,7 @@
   "dataset_dir": "data/agentic-bank-public",
   "dev": true,
   "engine": "tree",
-  "git_sha": "c01c2fc1341c05fb545f5a5992cc0d6bf3ac8131",
+  "git_sha": "29667629458c73efa3b349d251e242a4690f0534",
   "llm_adaptive_thinking": false,
   "llm_concurrency": 24,
   "llm_effort": "high",

@@ -56,7 +56,7 @@ class TestFlipTest:
         assert detail["flippers"] == ["b"]
         assert "empty mechanism pool" in (detail.get("note") or "")
 
-    def test_nonempty_mechanism_pool_rejects_outsider_singleton(self):
+    def test_nonempty_mechanism_pool_accepts_outsider_singleton(self):
         df = make_ledger(["a", "b", "c"])
         cats = {t: "revenue" for t in ["a", "b", "c"]}
 
@@ -71,7 +71,7 @@ class TestFlipTest:
             current_status="BREACH",
             mechanism_txn_ids=["a"],
         )
-        assert evidence is None
+        assert evidence == "b"
         assert detail["flippers"] == ["b"]
         assert "outside mechanism pool" in (detail.get("note") or "")
 

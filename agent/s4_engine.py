@@ -288,6 +288,21 @@ def is_marketing_reclass_quote(quote: str | None) -> bool:
     return bool(quote and _MARKETING_RECLASS_RE.search(quote))
 
 
+_PRELIMINARY_RECLASS_TOKENS = (
+    "предварительн",
+    "промежуточн этап",
+    "вопрос поставлен на промежуточн",
+    "preliminary question",
+    "interim working",
+)
+
+
+def is_preliminary_reclass_quote(quote: str | None) -> bool:
+    """True for draft «Предварительные вопросы» category-move prose (not final AR)."""
+    q = (quote or "").casefold()
+    return any(t in q for t in _PRELIMINARY_RECLASS_TOKENS)
+
+
 def _coerce_to_category(rec: Reclassification, desc: str = "") -> str | None:
     """Resolve to_category; refuse retainer→payroll and payroll-desc→opex overrides."""
     cat = rec.to_category or infer_to_category_from_quote(rec.quote)
@@ -332,6 +347,11 @@ def apply_reclassifications(
         status = getattr(rec, "status", "applied") or "applied"
         if status != "applied":
             flags.append(f"skipped reclass ({status}): {rec.txn_id or rec.counterparty or rec.quote[:80]}")
+            continue
+        if is_preliminary_reclass_quote(rec.quote):
+            flags.append(
+                f"skipped preliminary reclass: {rec.txn_id or rec.counterparty or rec.quote[:80]}"
+            )
             continue
         if rec.action == "include_in_period":
             idxs = _match_reclass_rows(source, rec)
@@ -1005,11 +1025,12 @@ def fill_missing_amounts_from_reclassifications(
         desc = str(out.at[idx, "description"]).casefold() if "description" in out.columns else ""
         quote = (rec.quote or "").casefold()
         to_cat = rec.to_category
-        # Explicit inflow language in the note wins over description expense tokens
-        # (e.g. «sales settlement» + «поступление»).
+        # Explicit inflow only (not bare «revenue»/«выручк» — matches «State Revenue Committee»).
         inflow_note = any(
-            tok in quote
-            for tok in ("поступлен", "inflow", "inflowing", "выручк", "revenue", "приход")
+            tok in quote for tok in ("поступлен", "inflow", "inflowing", "приход")
+        )
+        expense_note = any(
+            tok in quote for tok in ("расход", "expense", "налог", "tax", "коммуналь")
         )
         expense_cat = to_cat in {
             "operating_expense",
@@ -1021,10 +1042,9 @@ def fill_missing_amounts_from_reclassifications(
             "interest_expense",
             "capex",
         }
-        if not inflow_note and (
-            expense_cat
-            or any(tok in desc for tok in expense_toks)
-            or any(tok in quote for tok in ("расход", "expense", "налог", "tax", "коммуналь"))
+        # Expense category / «(расход)» always negate; inflow wins only over desc tokens.
+        if expense_cat or expense_note or (
+            not inflow_note and any(tok in desc for tok in expense_toks)
         ):
             amt = -amt
         out.at[idx, "amount"] = amt
@@ -1412,7 +1432,10 @@ def evaluate_sum_categories_vs_group_pct(
         return _missing_cats_stub(spec, ["pct_of_group_capex missing filter categories — stub"])
     total, ids = _sum_cats(period_df, categories, cats)
     value = abs(float(total))
-    limit = abs(float(group_capex)) * (float(spec.threshold) / 100.0)
+    thr = float(spec.threshold)
+    # LLM may emit either percent points (5.0) or a fraction (0.05).
+    frac = thr if 0.0 < thr <= 1.0 else thr / 100.0
+    limit = abs(float(group_capex)) * frac
     # Verdict against the derived monetary limit; expose raw sum as actual.
     status = verdict(value, spec.comparator, limit)
     return CovenantResult(
@@ -1653,6 +1676,7 @@ def apply_springing(
       - numerator_above / None: legacy — demote BREACH when |numerator| <= threshold
       - own_capex_above / trigger_above: active only when trigger_value > threshold
       - leverage_above: active only when trigger_value (NLR) > threshold
+      - payroll_ratio_above: active only when trigger_value (payroll/revenue) > threshold
       - min_quarter_revenue_below: active only when trigger_value (min q rev) < threshold
     """
     threshold = spec.springing_min_numerator
@@ -1660,12 +1684,15 @@ def apply_springing(
         return result
     mode = getattr(spec, "springing_mode", None) or "numerator_above"
 
-    if mode in {"own_capex_above", "trigger_above", "leverage_above"}:
+    if mode in {"own_capex_above", "trigger_above", "leverage_above", "payroll_ratio_above"}:
         if trigger_value is None:
             return result
         if abs(float(trigger_value)) <= float(threshold):
             result.status = "COMPLIANT"
-            label = "leverage" if mode == "leverage_above" else "trigger"
+            label = {
+                "leverage_above": "leverage",
+                "payroll_ratio_above": "payroll_ratio",
+            }.get(mode, "trigger")
             result.flags.append(
                 f"springing не сработал ({label}={abs(float(trigger_value))} <= {threshold})"
             )
@@ -1745,6 +1772,39 @@ def evaluate_ebitda_plus_categories(
     )
 
 
+
+def looks_like_money_linear_metric(quote_and_formula: str, threshold: float) -> bool:
+    """True when threshold is an absolute $ amount and formula is A−B / sum, not a ratio."""
+    if abs(float(threshold)) <= 1000:
+        return False
+    q = (quote_and_formula or "").casefold()
+    # Explicit ratio language with x-multiple stays a ratio even with large thr (rare).
+    if any(t in q for t in ("отношение", " ratio", "x ebitda", "/ ebitda", "/ebitda")):
+        if "minus" not in q and "вычет" not in q and " − " not in q and " - " not in q:
+            if "за вычетом" not in q and "less " not in q:
+                return False
+    return True
+
+
+def _money_minus_tokens(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    return any(
+        t in q
+        for t in (
+            "minus",
+            "за вычетом",
+            "вычет",
+            " less ",
+            " − ",
+            " – ",
+            " - ",
+            "минус",
+            "за вычетом",
+            "net of",
+        )
+    )
+
+
 def evaluate_ratio_generic(
     spec: CovenantSpec,
     period_df: pd.DataFrame,
@@ -1758,6 +1818,86 @@ def evaluate_ratio_generic(
     flags: list[str] = []
     quote = f"{spec.quote or ''} {spec.formula_description or ''}".casefold()
     has_ebitda = "ebitda" in quote
+    thr = float(spec.threshold)
+
+    # Absolute $ metrics mis-typed as ratio_generic: emit sum or A−B, never a coefficient.
+    if looks_like_money_linear_metric(quote, thr):
+        filt = _cat_list(spec.filter_categories, spec.filter_category, default=None) or []
+        minus = _money_minus_tokens(quote)
+        # True EBITDA ratios (Debt/EBITDA, ICR, margin) keep the ratio path below.
+        true_ebitda_ratio = has_ebitda and not minus and (
+            "долг" in quote
+            or "debt" in quote
+            or "leverage" in quote
+            or "покрытия" in quote
+            or "coverage" in quote
+            or "марж" in quote
+            or "/ ebitda" in quote
+            or "/ebitda" in quote
+            or "к ebitda" in quote
+        )
+        if not true_ebitda_ratio:
+            if minus and num_cats and den_cats:
+                left_cats, right_cats = list(num_cats), list(den_cats)
+                # LLM often swaps minuend/subtrahend into num/den; prefer quote order.
+                if (
+                    ("revenue" in left_cats or "выручк" in quote)
+                    and ("capex" in right_cats or "капитальн" in quote)
+                ):
+                    pass  # revenue − capex already
+                elif "revenue" in right_cats and "capex" in left_cats:
+                    left_cats, right_cats = right_cats, left_cats
+                elif (
+                    "financing_proceeds" in right_cats
+                    and any(c in left_cats for c in ("interest_expense", "taxes", "interest"))
+                ):
+                    left_cats, right_cats = right_cats, left_cats
+                left_raw, left_ids = _sum_cats(period_df, categories, left_cats)
+                right_raw, right_ids = _sum_cats(period_df, categories, right_cats)
+                value = abs(float(left_raw)) - abs(float(right_raw))
+                contrib = left_ids + right_ids
+                flags.append(f"money_linear {left_cats} minus {right_cats}")
+            elif num_cats and not den_cats:
+                num_raw, num_ids = _sum_cats(period_df, categories, num_cats)
+                value = abs(float(num_raw))
+                contrib = num_ids
+                flags.append(f"money_linear sum {num_cats}")
+            elif filt and not den_cats:
+                num_raw, num_ids = _sum_cats(period_df, categories, filt)
+                value = abs(float(num_raw))
+                contrib = num_ids
+                flags.append(f"money_linear sum filter {filt}")
+            elif num_cats and den_cats and not looks_like_ratio_language(quote):
+                # Capex (etc.) stuffed into num/den by LLM — treat as sum of num cats.
+                num_raw, num_ids = _sum_cats(period_df, categories, num_cats)
+                value = abs(float(num_raw))
+                contrib = num_ids
+                flags.append(f"money_linear sum-not-ratio {num_cats}")
+            elif den_cats and not num_cats and not has_ebitda:
+                den_raw, den_ids = _sum_cats(period_df, categories, den_cats)
+                value = abs(float(den_raw))
+                contrib = den_ids
+                flags.append(f"money_linear sum den-as-metric {den_cats}")
+            else:
+                value = None
+                contrib = []
+            if value is not None:
+                status = verdict(value, spec.comparator, thr)
+                result = CovenantResult(
+                    clause=spec.clause,
+                    status=status,
+                    actual=round(abs(value), 2) if abs(value) > 0 else 0.01,
+                    contributing_txn_ids=list(dict.fromkeys(contrib)),
+                    flags=flags,
+                    inputs={
+                        "value_raw": float(value),
+                        "total": abs(float(value)),
+                        "numerator": abs(float(value)),
+                        "period_row_count": int(len(period_df)),
+                        "currency_mix": _currency_mix(period_df),
+                    },
+                )
+                return apply_springing(spec, result)
 
     # R2: rebuild EBITDA as rev − opex when den empty/other or Adj.EBITDA / Revenue.
     if has_ebitda:
@@ -1778,20 +1918,70 @@ def evaluate_ratio_generic(
                     f"(materiality={materiality_threshold_usd})"
                 )
         ebitda_ids = rev_ids + opex_ids + addback_ids
+        opex_line_den = bool(den_cats) and set(den_cats) <= {"rent", "utilities", "insurance"} and len(den_cats) >= 1
+        dscr = looks_like_dscr(quote) or (
+            not num_cats
+            and bool(den_cats)
+            and set(den_cats) == {"interest_expense", "financing"}
+        )
         interest_den = bool(den_cats) and set(den_cats) <= {"interest_expense"}
         icr = (
-            "покрытия процентов" in quote
-            or "покрытие процентов" in quote
-            or "interest coverage" in quote
-            or (not num_cats and interest_den)
+            not dscr
+            and (
+                "покрытия процентов" in quote
+                or "покрытие процентов" in quote
+                or "interest coverage" in quote
+                or (not num_cats and interest_den)
+            )
         )
-        if icr or interest_den:
+        if dscr:
+            int_raw, int_ids = _sum_cats(period_df, categories, ["interest_expense"])
+            # Principal repayments only — financing proceeds (inflows) are not debt service.
+            col = _amount_col(period_df)
+            fin_mask = period_df["txn_id"].map(lambda tid: categories.get(str(tid)) == "financing")
+            fin_out = period_df[fin_mask & (period_df[col].astype(float) < 0)]
+            fin_raw = float(-fin_out[col].sum()) if not fin_out.empty else 0.0
+            fin_ids = list(fin_out["txn_id"].astype(str)) if not fin_out.empty else []
+            numerator = abs(float(ebitda))
+            denominator = abs(float(int_raw)) + abs(float(fin_raw))
+            contrib = ebitda_ids + int_ids + fin_ids
+            flags.append("ratio_generic DSCR = EBITDA/(interest+principal_outflows)")
+        elif icr or interest_den:
             den_raw, den_ids = _sum_cats(period_df, categories, ["interest_expense"])
             numerator = abs(float(ebitda))
             denominator = abs(float(den_raw))
             contrib = ebitda_ids + den_ids
             flags.append("ratio_generic interest coverage = EBITDA/interest")
-        elif adj or (not num_cats and (not den_cats or den_cats == ["revenue"])):
+        elif opex_line_den and not num_cats:
+            den_raw, den_ids = _sum_cats(period_df, categories, list(den_cats))
+            numerator = abs(float(ebitda))
+            denominator = abs(float(den_raw))
+            contrib = ebitda_ids + den_ids
+            flags.append(f"ratio_generic EBITDA/opex_lines {den_cats}")
+        elif looks_like_net_debt(quote) or (
+            num_cats
+            and set(num_cats) == {"financing_proceeds", "financing"}
+        ):
+            drawn_raw, drawn_ids = _sum_cats(period_df, categories, ["financing_proceeds"])
+            repay_raw, repay_ids = _sum_cats(period_df, categories, ["financing"])
+            numerator = abs(float(drawn_raw)) - abs(float(repay_raw))
+            denominator = abs(float(ebitda))
+            contrib = drawn_ids + repay_ids + ebitda_ids
+            flags.append("ratio_generic NetDebt/EBITDA = proceeds−repayments")
+        elif looks_like_total_debt_leverage(quote) and (
+            not num_cats or num_cats == ["financing_proceeds"]
+        ):
+            num_raw, num_ids = _sum_cats(period_df, categories, ["financing_proceeds"])
+            numerator = abs(float(num_raw))
+            denominator = abs(float(ebitda))
+            contrib = num_ids + ebitda_ids
+            flags.append("ratio_generic TotalDebt/EBITDA")
+        elif adj or (
+            not num_cats
+            and (not den_cats or den_cats == ["revenue"])
+            and not looks_like_total_debt_leverage(quote)
+            and not looks_like_dscr(quote)
+        ):
             numerator = abs(float(ebitda))
             denominator = abs(float(rev_raw))
             contrib = ebitda_ids + rev_ids
@@ -2126,38 +2316,145 @@ def looks_like_unrestricted_absolute_cap(quote_and_formula: str, threshold: floa
 
 
 _LEVERAGE_TRIGGER_RE = re.compile(
-    r"(?:net\s+leverage|n\s*l\s*r|чистый\s+леверидж|леверидж|leverage\s+ratio)"
-    r".{0,40}?"
-    r"(?:>|≥|exceed|превыш\w*|above|более|свыше)?"
-    r".{0,10}?"
-    r"(\d+(?:[.,]\d+)?)\s*x?",
+    r"(?:"
+    r"net\s+leverage|n\s*l\s*r|чистый\s+леверидж|леверидж|leverage\s+ratio|leverage"
+    r"|коэффициент\s+долговой\s+нагрузк\w*"
+    r"|долговой\s+нагрузк\w*"
+    r"|долга\s+к\s+ebitda"
+    r"|debt\s*/\s*ebitda"
+    r"|total\s+debt\s*/\s*ebitda"
+    r"|совокупного\s+долга\s+к\s+ebitda"
+    r")"
+    r".{0,80}?"
+    r"(?:>|≥|exceed|превыш\w*|above|более|свыше|величины)?"
+    r".{0,20}?"
+    r"(\d+(?:[.,]\d+)?)\s*[xх×]",
     re.IGNORECASE | re.DOTALL,
+)
+
+# Fallback when the clause omits the trailing «x».
+_LEVERAGE_TRIGGER_BARE_RE = re.compile(
+    r"(?:"
+    r"net\s+leverage|n\s*l\s*r|чистый\s+леверидж|леверидж|leverage\s+ratio|leverage"
+    r"|коэффициент\s+долговой\s+нагрузк\w*"
+    r"|долговой\s+нагрузк\w*"
+    r"|долга\s+к\s+ebitda"
+    r"|debt\s*/\s*ebitda"
+    r"|total\s+debt\s*/\s*ebitda"
+    r"|совокупного\s+долга\s+к\s+ebitda"
+    r")"
+    r".{0,80}?"
+    r"(?:>|≥|exceed|превыш\w*|above|более|свыше|величины)"
+    r".{0,20}?"
+    r"(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_LEVERAGE_MARKER_TOKENS = (
+    "leverage",
+    "леверидж",
+    "nlr",
+    "n l r",
+    "долговой нагруз",
+    "долга к ebitda",
+    "debt/ebitda",
+    "debt / ebitda",
+    "total debt / ebitda",
+    "коэффициент долговой",
 )
 
 
 def scrape_leverage_springing_threshold(quote_and_formula: str) -> float | None:
-    """Parse NLR / leverage trigger (e.g. «если Net Leverage > 2.5x»)."""
+    """Parse NLR / leverage trigger (e.g. «если Net Leverage > 2.5x»).
+
+    Also accepts RU «Коэффициент долговой нагрузки … превышает 3.00x» and
+    Debt/EBITDA phrasing without the English word «leverage».
+    Prefers an explicit «Nx» token so «Пункту 5.1» is not mistaken for the trigger.
+    """
     q = quote_and_formula or ""
-    if not any(t in q.casefold() for t in ("leverage", "леверидж", "nlr", "n l r")):
+    qlow = q.casefold()
+    if not any(t in qlow for t in _LEVERAGE_MARKER_TOKENS):
         return None
     if not any(
-        t in q.casefold()
-        for t in ("если", "if ", "when ", "only if", "только если", "при условии", "springing")
+        t in qlow
+        for t in (
+            "если",
+            "if ",
+            "when ",
+            "когда",
+            "only if",
+            "только если",
+            "при условии",
+            "springing",
+            "одновременно",
+            "случаем неисполнения",
+            "event of default",
+        )
     ):
         # Still allow «Net Leverage Ratio exceeds 2.5x» without explicit if.
-        if not any(t in q.casefold() for t in ("exceed", "превыш", "above", "более", ">")):
+        if not any(t in qlow for t in ("exceed", "превыш", "above", "более", ">")):
             return None
-    m = _LEVERAGE_TRIGGER_RE.search(q)
-    if not m:
-        return None
-    raw = m.group(1).replace(",", ".")
+
+    def _parse(m: re.Match[str] | None) -> float | None:
+        if not m:
+            return None
+        # Reject clause-number false positives («Пункту 5.1»).
+        prefix = q[max(0, m.start(1) - 12) : m.start(1)].casefold()
+        if "пункт" in prefix or prefix.rstrip().endswith("п."):
+            return None
+        raw = m.group(1).replace(",", ".")
+        try:
+            val = float(raw)
+        except ValueError:
+            return None
+        if not (0.1 <= val <= 50.0):
+            return None
+        return val
+
+    val = _parse(_LEVERAGE_TRIGGER_RE.search(q))
+    if val is not None:
+        return val
+    return _parse(_LEVERAGE_TRIGGER_BARE_RE.search(q))
+
+
+def looks_like_leverage_springing_capex(quote_and_formula: str, threshold: float) -> bool:
+    """Monetary capex ceiling that springs when leverage / debt-load exceeds Xx."""
+    if float(threshold) < 100_000.0:
+        return False
+    q = (quote_and_formula or "").casefold()
+    if "капитальн" not in q and "capex" not in q:
+        return False
+    return scrape_leverage_springing_threshold(quote_and_formula) is not None
+
+
+def infer_money_metric_filter_categories(quote_and_formula: str) -> list[str]:
+    """Best-effort category list for scale-mismatch rescue (capex first)."""
+    q = (quote_and_formula or "").casefold()
+    if "капитальн" in q or "capex" in q:
+        return ["capex"]
+    if "страхов" in q or "insurance" in q:
+        return ["insurance"]
+    if "аренд" in q or " rent" in q or q.startswith("rent"):
+        return ["rent"]
+    if "маркетинг" in q or "marketing" in q:
+        return ["other"]  # description_bucket path preferred; filter fallback
+    if looks_like_unrestricted_language(q):
+        return ["unrestricted_subsidiary_transfer"]
+    return ["capex"]
+
+
+def is_scale_mismatch(threshold: float, actual: float) -> bool:
+    """True when threshold and actual look like different units (money vs ratio)."""
     try:
-        val = float(raw)
-    except ValueError:
-        return None
-    if not (0.1 <= val <= 50.0):
-        return None
-    return val
+        thr = abs(float(threshold))
+        act = abs(float(actual))
+    except (TypeError, ValueError):
+        return False
+    if thr >= 1000.0 and act < 100.0:
+        return True
+    if thr < 100.0 and act >= 1000.0:
+        return True
+    return False
 
 
 def looks_like_ebitda_plus_financing_floor(quote_and_formula: str, threshold: float) -> bool:
@@ -2186,7 +2483,8 @@ def looks_like_ebitda_plus_financing_floor(quote_and_formula: str, threshold: fl
 def normalize_percent_threshold(spec: CovenantSpec) -> float | None:
     """When quote states a percent and threshold is 1..100, return fraction (80 → 0.80).
 
-    Skips absolute $ caps and pct_of_group_capex (already treats threshold as percent).
+    Skips absolute $ caps, pct_of_group_capex, and leverage x-multiples (Debt/EBITDA)
+    even when a carve-out percent appears in the same quote.
     """
     thr = float(spec.threshold)
     if thr <= 1.0 or thr > 100.0:
@@ -2201,6 +2499,27 @@ def normalize_percent_threshold(spec: CovenantSpec) -> float | None:
     if thr >= 1000:
         return None
     if "$" in q and thr >= 100:
+        return None
+    # Leverage / coverage multiples are "3.0x", not percents — incidental carve-out %
+    # in the same quote must not rewrite them to 0.03.
+    if looks_like_total_debt_leverage(qlow) or looks_like_dscr(qlow) or looks_like_net_debt(qlow):
+        return None
+    if any(
+        t in qlow
+        for t in (
+            "x ebitda",
+            "×",
+            "кратен",
+            "множител",
+            "leverage ratio",
+            "долговой нагрузк",
+            "долг/ebitda",
+            "debt/ebitda",
+        )
+    ):
+        return None
+    # Threshold written with trailing x in quote (e.g. "3.00x").
+    if re.search(rf"{re.escape(str(thr).rstrip('0').rstrip('.'))}\s*x\b", qlow):
         return None
     # Ratio / share covenants only.
     if not any(
@@ -2304,6 +2623,12 @@ _MARKETING_NEEDLES = (
     "media buy",
     "sponsorship",
     "newsletter marketing",
+    "billboard",
+    "ad campaign",
+    "outdoor advertising",
+    "outdoor ad",
+    "radio ad",
+    "media schedule",
     "маркетинг",
     "реклам",
 )
@@ -2330,7 +2655,7 @@ _DESC_CREDIT_NEEDLES = (
 
 def description_bucket_from_quote(quote_and_formula: str) -> str | None:
     q = (quote_and_formula or "").casefold()
-    if any(t in q for t in ("маркетинг", "marketing", "advertis", "реклам")):
+    if any(t in q for t in ("маркетинг", "marketing", "advertis", "реклам", "billboard", "ad campaign", "outdoor")):
         return "marketing"
     if any(t in q for t in ("консультац", "consulting", "consultancy", "advisory engagement")):
         return "consulting"
@@ -2428,15 +2753,28 @@ def scrape_quarterly_revenue_waiver_floor(document_text: str | None) -> float | 
 
 
 def looks_like_borrower_capex_to_revenue(quote_and_formula: str) -> bool:
+    """True for Capex/Revenue ceilings — not revenue+financing coverage of opex+capex."""
     q = (quote_and_formula or "").casefold()
     if looks_like_group_capex_ebitda_ratio(q):
         return False
     if looks_like_ebitda_ratio_semantics(q):
         return False
+    # (revenue + financing) / (opex + capex) mentions both words but is not Capex/Revenue.
+    if "операционн" in q or "operating expense" in q or "operating_expense" in q:
+        return False
+    if "финансирован" in q or "financing" in q:
+        return False
     has_capex = "капитальн" in q or "capex" in q
     has_rev = "выручк" in q or "revenue" in q
     ratio_ish = "отношени" in q or "/" in q or "ratio" in q or "0." in q
-    return has_capex and has_rev and ratio_ish
+    if not (has_capex and has_rev and ratio_ish):
+        return False
+    ordered = bool(
+        re.search(r"(капитальн|capex).{0,60}(выручк|revenue)", q)
+        or re.search(r"(капитальн|capex)\s*/\s*(выручк|revenue)", q)
+    )
+    ceiling = any(t in q for t in ("не более", "не превыша", "shall not exceed", "max "))
+    return ordered or ceiling
 
 
 def alias_financing_categories(cats: list[str] | None) -> list[str]:
@@ -2446,8 +2784,74 @@ def alias_financing_categories(cats: list[str] | None) -> list[str]:
     return out
 
 
+
+def looks_like_net_debt(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    if "net debt" in q or "чистый долг" in q:
+        return True
+    if ("drawn" in q or "выборк" in q or "поступлен" in q) and (
+        "repay" in q or "погашен" in q or "scheduled" in q
+    ):
+        return True
+    if "less" in q and ("repay" in q or "погашен" in q) and ("debt" in q or "долг" in q):
+        return True
+    return False
+
+def looks_like_dscr(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    return bool(
+        "dscr" in q
+        or "debt service" in q
+        or "debt-service" in q
+        or "обслуживани" in q and "долг" in q
+        or "обслуживание долга" in q
+        or ("principal repayment" in q and "interest" in q and "ebitda" in q)
+    )
+
+
+def looks_like_total_debt_leverage(quote_and_formula: str) -> bool:
+    """Debt/EBITDA leverage — not DSCR / interest coverage / incidental debt mentions."""
+    q = (quote_and_formula or "").casefold()
+    if looks_like_dscr(q):
+        return False
+    if "ebitda" not in q:
+        return False
+    # Require an explicit Total-Debt / leverage-ratio shape — bare "debt"+"ebitda"
+    # matches too many unrelated clauses (springing, carve-outs, ICR disclaimers).
+    return bool(
+        "общий долг" in q
+        or "total debt" in q
+        or "совокупный долг" in q
+        or ("совокупн" in q and "долг" in q and ("/" in q or "отношен" in q or "ratio" in q))
+        or "долговой нагрузк" in q
+        or "net leverage" in q
+        or "leverage ratio" in q
+        or "отношение долг" in q
+        or (("total debt" in q or "общий долг" in q or "совокупный долг" in q)
+            and "ebitda" in q)
+        or (
+            ("долг" in q or "debt" in q)
+            and ("/ ebitda" in q or "/ebitda" in q or "к ebitda" in q or " to ebitda" in q)
+            and "service" not in q
+            and "покрытия" not in q
+        )
+    )
+
+
+def looks_like_ebitda_over_opex_lines(quote_and_formula: str) -> bool:
+    q = (quote_and_formula or "").casefold()
+    if "ebitda" not in q:
+        return False
+    has_rent = "аренд" in q or "rent" in q
+    has_util = "коммуналь" in q or "utilit" in q
+    has_ins = "страхов" in q or "insurance" in q
+    return has_rent and has_util and has_ins
+
+
 def looks_like_financing_debt_ratio(quote_and_formula: str) -> bool:
     q = (quote_and_formula or "").casefold()
+    if looks_like_dscr(q):
+        return False
     return bool(
         "финанс" in q
         or "financing" in q
@@ -2644,21 +3048,92 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
             or "interest coverage" in q
             or "interest_expense" in (spec.denominator_categories or [])
             or spec.denominator_category == "interest_expense"
-        ):
+        ) and not looks_like_dscr(q):
             updates.setdefault("denominator_categories", ["interest_expense"])
             updates["numerator_categories"] = []
             updates["numerator_category"] = None
+        # DSCR: EBITDA / (interest + principal repayments in financing)
+        if looks_like_dscr(q):
+            updates["denominator_categories"] = ["interest_expense", "financing"]
+            updates["denominator_category"] = None
+            updates["numerator_categories"] = []
+            updates["numerator_category"] = None
+        # Total Debt / EBITDA leverage
+        if looks_like_total_debt_leverage(q):
+            updates["numerator_categories"] = ["financing_proceeds"]
+            updates["numerator_category"] = None
+            updates["denominator_categories"] = []
+            updates["denominator_category"] = None
+        # EBITDA / (rent + utilities + insurance)
+        if looks_like_ebitda_over_opex_lines(q):
+            updates["denominator_categories"] = ["rent", "utilities", "insurance"]
+            updates["denominator_category"] = None
+            updates["numerator_categories"] = []
+            updates["numerator_category"] = None
         # Adjusted EBITDA / Revenue
-        if ("скорректирован" in q or "adjusted" in q) and "выручк" in q:
+        if ("скорректирован" in q or "adjusted" in q) and "выручк" in q and not looks_like_total_debt_leverage(q) and not looks_like_dscr(q):
             updates["numerator_categories"] = []
             updates["numerator_category"] = None
             updates["denominator_categories"] = ["revenue"]
             updates["denominator_category"] = None
 
+    # Absolute $ borrower capex mis-typed as ratio_generic with money threshold.
+    # Never rewrite Group/consolidated capex ceilings (those stay on group_capex path).
+    if (
+        looks_like_money_linear_metric(q, float(updates.get("threshold", spec.threshold)))
+        and not looks_like_ratio_language(q)
+        and not looks_like_total_debt_leverage(q)
+        and not looks_like_dscr(q)
+        and not looks_like_net_debt(q)
+        and not _money_minus_tokens(q)
+        and ("капитальн" in q or "capex" in q)
+        and "групп" not in q
+        and "group" not in q
+        and "консолидир" not in q
+        and "consolidated" not in q
+        and not looks_like_group_capex_ebitda_ratio(q)
+        and not looks_like_group_capex_absolute_language(q)
+        and abs(float(updates.get("threshold", spec.threshold))) > 1000
+    ):
+        updates["covenant_type"] = "sum_category"
+        updates["filter_categories"] = ["capex"]
+        updates["filter_category"] = "capex"
+        updates["numerator_categories"] = []
+        updates["denominator_categories"] = []
+        updates["numerator_category"] = None
+        updates["denominator_category"] = None
+
     if "springing" in q or "только если" in q or "при условии что" in q:
         if "поступлен" in q and "финанс" in q and not updates.get("ebitda_plus_categories"):
             updates.setdefault("covenant_type", "ratio_generic")
             updates.setdefault("numerator_categories", ["financing_proceeds"])
+        # Springing rent cap if payroll / revenue > X% (F2 6.2).
+        if (
+            ("аренд" in q or "rent" in q)
+            and ("payroll" in q or "оплат" in q or "фонд оплаты" in q or "заработн" in q)
+            and ("выручк" in q or "revenue" in q)
+            and abs(float(updates.get("threshold", spec.threshold))) > 1000
+        ):
+            updates["covenant_type"] = "sum_category"
+            updates["filter_categories"] = ["rent"]
+            updates["filter_category"] = "rent"
+            updates["numerator_categories"] = []
+            updates["denominator_categories"] = []
+            updates["numerator_category"] = None
+            updates["denominator_category"] = None
+            updates["springing_mode"] = "payroll_ratio_above"
+            # Default 30% unless a percent is parseable from the clause.
+            trig = 0.30
+            m = re.search(
+                r"(\d{1,2}(?:[.,]\d+)?)\s*%",
+                f"{spec.quote or ''} {spec.formula_description or ''}",
+            )
+            if m:
+                try:
+                    trig = float(m.group(1).replace(",", ".")) / 100.0
+                except ValueError:
+                    pass
+            updates["springing_min_numerator"] = trig
 
     # Absolute Group-capex monetary ceiling (not Group/EBITDA ratio).
     if is_absolute_group_capex_ceiling(spec.model_copy(update=updates) if updates else spec):
@@ -2670,11 +3145,19 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
         updates["denominator_category"] = None
 
     # Financing / debt leverage: financing → financing_proceeds.
-    if looks_like_financing_debt_ratio(q) or "financing" in (
-        list(updates.get("numerator_categories", spec.numerator_categories or []))
-        + list(updates.get("filter_categories", spec.filter_categories or []))
-        + ([updates["numerator_category"]] if updates.get("numerator_category") else [])
-        + ([spec.numerator_category] if spec.numerator_category else [])
+    # Skip DSCR (den keeps financing = principal) and Net Debt (drawn − repayments).
+    if (
+        not looks_like_dscr(q)
+        and not looks_like_net_debt(q)
+        and (
+            looks_like_financing_debt_ratio(q)
+            or "financing" in (
+                list(updates.get("numerator_categories", spec.numerator_categories or []))
+                + list(updates.get("filter_categories", spec.filter_categories or []))
+                + ([updates["numerator_category"]] if updates.get("numerator_category") else [])
+                + ([spec.numerator_category] if spec.numerator_category else [])
+            )
+        )
     ):
         num = alias_financing_categories(
             updates.get("numerator_categories", spec.numerator_categories)
@@ -2695,6 +3178,14 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
             updates["numerator_category"] = "financing_proceeds"
         if (updates.get("filter_category") or spec.filter_category) == "financing":
             updates["filter_category"] = "financing_proceeds"
+
+    # Net Debt / EBITDA: drawn proceeds minus scheduled repayments over EBITDA.
+    if looks_like_net_debt(q) and "ebitda" in q:
+        updates.setdefault("covenant_type", "ratio_generic")
+        updates["numerator_categories"] = ["financing_proceeds", "financing"]
+        updates["numerator_category"] = None
+        updates["denominator_categories"] = []
+        updates["denominator_category"] = None
 
     # Marketing / consulting description buckets (avoid garbage filter=other stubs).
     bucket = description_bucket_from_quote(q)
@@ -2765,11 +3256,26 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
                     break
 
     # Capex / revenue with quarterly-revenue waiver (from document body if quote truncated).
-    if looks_like_borrower_capex_to_revenue(q) or (
-        document_text
-        and scrape_quarterly_revenue_waiver_floor(document_text) is not None
-        and ("капитальн" in q or "capex" in q)
-        and ("выручк" in q or "revenue" in q or "0.32" in q)
+    # Never overwrite a coverage-style extract (revenue+financing) / (opex+capex).
+    _num_now = list(updates.get("numerator_categories") or spec.numerator_categories or [])
+    _den_now = list(updates.get("denominator_categories") or spec.denominator_categories or [])
+    _coverage_style = (
+        "revenue" in _num_now
+        and any(c in _num_now for c in ("financing_proceeds", "financing"))
+        and "capex" in _den_now
+    ) or (
+        "operating_expense" in _den_now and "capex" in _den_now and "revenue" in _num_now
+    )
+    if not _coverage_style and (
+        looks_like_borrower_capex_to_revenue(q)
+        or (
+            document_text
+            and scrape_quarterly_revenue_waiver_floor(document_text) is not None
+            and ("капитальн" in q or "capex" in q)
+            and ("выручк" in q or "revenue" in q or "0.32" in q)
+            and "операционн" not in q
+            and "финансирован" not in q
+        )
     ):
         if not looks_like_group_capex_ebitda_ratio(q) and not is_absolute_group_capex_ceiling(
             spec.model_copy(update=updates) if updates else spec
@@ -2816,14 +3322,26 @@ def refine_covenant_spec(spec: CovenantSpec, document_text: str | None = None) -
 
     # Springing: Net Leverage / NLR trigger → absolute transfer / marketing-style sum.
     lev = scrape_leverage_springing_threshold(q)
+    thr_money = float(updates.get("threshold", spec.threshold))
     if lev is not None and (
-        looks_like_unrestricted_absolute_cap(q, float(updates.get("threshold", spec.threshold)))
+        looks_like_unrestricted_absolute_cap(q, thr_money)
         or looks_like_unrestricted_language(q)
     ):
         updates.setdefault("covenant_type", "sum_category")
         if not (updates.get("filter_categories") or spec.filter_categories):
             updates["filter_categories"] = ["unrestricted_subsidiary_transfer"]
             updates["filter_category"] = "unrestricted_subsidiary_transfer"
+        updates["springing_mode"] = "leverage_above"
+        updates["springing_min_numerator"] = lev
+    elif lev is not None and looks_like_leverage_springing_capex(q, thr_money):
+        # Capex ceiling / dual-default (leverage AND capex): report CapEx, demote via springing.
+        updates["covenant_type"] = "sum_category"
+        updates["filter_categories"] = ["capex"]
+        updates["filter_category"] = "capex"
+        updates["numerator_categories"] = []
+        updates["denominator_categories"] = []
+        updates["numerator_category"] = None
+        updates["denominator_category"] = None
         updates["springing_mode"] = "leverage_above"
         updates["springing_min_numerator"] = lev
 
@@ -2907,6 +3425,11 @@ _FORCE_OTHER_NEEDLES = (
     "media buy",
     "advertising",
     "sponsorship",
+    "billboard",
+    "ad campaign",
+    "outdoor advertising",
+    "outdoor ad",
+    "radio ad",
 )
 
 

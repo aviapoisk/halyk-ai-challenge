@@ -81,7 +81,10 @@ from agent.s4_engine import (
     evaluate_sum_categories_vs_group_pct,
     evaluate_ebitda_plus_categories,
     fill_missing_amounts_from_reclassifications,
+    infer_money_metric_filter_categories,
     is_absolute_group_capex_ceiling,
+    is_preliminary_reclass_quote,
+    is_scale_mismatch,
     reduce_over_calendar_quarters,
     sum_description_bucket,
     filter_df_by_relevance,
@@ -98,6 +101,7 @@ from agent.s4_engine import (
     related_party_token_overlap_candidates,
     repair_degenerate_categories,
     resolve_fx_rate,
+    scrape_leverage_springing_threshold,
     scrape_materiality_from_notes,
     scrape_missing_txn_amounts_from_notes,
     scrape_off_ledger_from_notes,
@@ -116,6 +120,7 @@ from agent.schemas import (
     KYCFacts,
     LoanAgreementFacts,
     Reclassification,
+    RelatedParty,
 )
 from agent.sections import longest_section_around_anchor
 
@@ -184,6 +189,7 @@ def build_run_config(config, *, sha: str | None = None) -> dict:
 def _merge_auditor_facts(
     auditor_docs: list[IngestedDocument],
     auditor_facts_list: list[AuditorNotesFacts],
+    extra_scrape_texts: list[str] | None = None,
 ) -> tuple[
     AuditorNotesFacts | None,
     list[Reclassification],
@@ -274,8 +280,29 @@ def _merge_auditor_facts(
             materiality = m if materiality is None else min(materiality, m)
         if not is_draft:
             for r in facts.reclassifications:
+                if is_preliminary_reclass_quote(r.quote):
+                    flags.append(
+                        f"skipped preliminary reclass extract: "
+                        f"{r.txn_id or r.counterparty or 'anon'}"
+                    )
+                    continue
                 key = (r.txn_id, round(float(r.amount), 2) if r.amount is not None else None, r.action)
                 if key in seen_reclass:
+                    # Prefer applied twin over referred_elsewhere / informational.
+                    status = (r.status or "applied")
+                    if status == "applied":
+                        for i, prev in enumerate(reclassifications):
+                            pk = (
+                                prev.txn_id,
+                                round(float(prev.amount), 2) if prev.amount is not None else None,
+                                prev.action,
+                            )
+                            if pk == key and (prev.status or "applied") != "applied":
+                                reclassifications[i] = r
+                                flags.append(
+                                    f"preferred applied reclass over {prev.status} for {r.txn_id}"
+                                )
+                                break
                     continue
                 seen_reclass.add(key)
                 reclassifications.append(r)
@@ -297,23 +324,49 @@ def _merge_auditor_facts(
     non_draft_paired = [
         (f, d) for f, d in paired if not auditor_doc_is_interim_or_draft(d.normalized_text)
     ]
+    # Amount scrape corpus: authoritative notes + ALL borrower docs (treasury memos etc.).
+    # Reclassifications still come only from paired authoritative path above.
+    amount_scrape_corpus = list(scrape_notes)
+    for _f, d in paired_all:
+        if auditor_doc_is_interim_or_draft(d.normalized_text) and authoritative:
+            continue
+        txt = d.normalized_text
+        if txt and txt not in amount_scrape_corpus:
+            amount_scrape_corpus.append(txt)
+    for txt in extra_scrape_texts or []:
+        if txt and txt not in amount_scrape_corpus:
+            amount_scrape_corpus.append(txt)
     scraped_fills = (
-        scrape_missing_txn_amounts_from_notes(scrape_notes)
-        if non_draft_paired or authoritative
+        scrape_missing_txn_amounts_from_notes(amount_scrape_corpus)
+        if (non_draft_paired or authoritative or amount_scrape_corpus)
         else []
     )
     existing_txn = {str(r.txn_id) for r in reclassifications if r.txn_id and r.amount is not None}
     existing_any = {str(r.txn_id) for r in reclassifications if r.txn_id}
-    # W5.1 denial: authoritative «переклассификац… не требова» → no inventing new
-    # category-move scrapes (amount-fill onto existing structured rows still ok).
-    if reclass_denied and not any(
-        (r.status or "applied") == "applied" and r.action == "reclassify" and r.to_category
-        for r in reclassifications
-    ):
+    # W5.1 denial: authoritative «переклассификац… не требова» → drop LLM category-moves
+    # (including null to_category that infer_to_category would otherwise fill) and do not
+    # invent new category-move scrapes. Amount-fill onto NaN ledger rows stays allowed.
+    if reclass_denied:
+        kept: list = []
+        for r in reclassifications:
+            if r.action == "reclassify":
+                flags.append(
+                    "auditor reclass denial: dropped category-move "
+                    f"{r.txn_id or r.counterparty or 'anon'}"
+                )
+                continue
+            kept.append(r)
+        reclassifications = kept
+        existing_txn = {str(r.txn_id) for r in reclassifications if r.txn_id and r.amount is not None}
+        existing_any = {str(r.txn_id) for r in reclassifications if r.txn_id}
         flags.append("auditor reclass denial: scraped category-move rows withheld")
         for rec in scraped_fills:
             tid = str(rec.txn_id) if rec.txn_id else ""
             if not tid or rec.amount is None or tid in existing_txn:
+                continue
+            scrape_q = (rec.quote or "").casefold()
+            # Do not revive category-move prose as a «denial-safe» fill (P6).
+            if "переклассифицир" in scrape_q or "reclassif" in scrape_q:
                 continue
             if tid in existing_any:
                 # Fill amount on an existing structured row.
@@ -325,7 +378,14 @@ def _merge_auditor_facts(
                         break
             else:
                 # Amount-only fill for NaN ledger rows (treasury / notes) — not a category move.
-                reclassifications.append(rec)
+                safe = rec.model_copy(
+                    update={
+                        "action": "include_in_period",
+                        "to_category": None,
+                        "from_category": None,
+                    }
+                )
+                reclassifications.append(safe)
                 flags.append(f"scraped missing amount for {tid} from notes/treasury (denial-safe fill)")
                 existing_txn.add(tid)
     else:
@@ -892,7 +952,11 @@ async def _extract_case(
         auditor_doc_id,
         merge_flags,
         note_named_txn_ids,
-    ) = _merge_auditor_facts(auditor_docs, auditor_facts_list)
+    ) = _merge_auditor_facts(
+        auditor_docs,
+        auditor_facts_list,
+        extra_scrape_texts=[d.normalized_text for d in scenario_docs],
+    )
     flags.extend(merge_flags)
     still_bad = [
         r
@@ -1098,13 +1162,15 @@ async def _finish_case(
     flags.extend(cat_flags)
 
     # D5: token-overlap related-party candidates → LLM confirm against KYC text (never auto-include).
-    if kyc_facts is not None and not scen_ledger.empty:
-        known = [p.counterparty_name for p in kyc_facts.counterparties]
+    # When KYC is missing/empty, keep candidates as a soft Python fallback for RP covenants.
+    rp_overlap_fallback: list[RelatedParty] = []
+    if not scen_ledger.empty:
+        known = [p.counterparty_name for p in kyc_facts.counterparties] if kyc_facts else []
         cps = sorted({str(c) for c in scen_ledger["counterparty"].astype(str)})
         candidates = related_party_token_overlap_candidates(
             loan_facts.borrower_name, cps, set(known)
         )
-        if candidates:
+        if candidates and kyc_facts is not None:
             dossier_parts = [d.normalized_text for d in (ext.kyc_docs or [])]
             if selected_loan_doc is not None:
                 dossier_parts.append(selected_loan_doc.normalized_text)
@@ -1132,6 +1198,27 @@ async def _finish_case(
                     f"related_party overlap candidates not confirmed ({len(candidates)}): "
                     + ", ".join(candidates[:8])
                 )
+                rp_overlap_fallback = [
+                    RelatedParty(
+                        counterparty_name=name,
+                        voting_rights_pct=100.0,
+                        quote="related-party token-overlap unconfirmed fallback",
+                    )
+                    for name in candidates
+                ]
+        elif candidates:
+            flags.append(
+                f"related_party_overlap_unconfirmed_fallback ({len(candidates)}): "
+                + ", ".join(candidates[:8])
+            )
+            rp_overlap_fallback = [
+                RelatedParty(
+                    counterparty_name=name,
+                    voting_rights_pct=100.0,
+                    quote="related-party token-overlap unconfirmed fallback",
+                )
+                for name in candidates
+            ]
 
     ledger_before_reclass = scen_ledger.copy() if dev else None
 
@@ -1357,6 +1444,7 @@ async def _finish_case(
                 engine_diff_counter=engine_diff_counter,
                 relevance=relevance,
                 mechanism_txn_ids=mech_ids,
+                rp_overlap_fallback=rp_overlap_fallback,
             )
         except Exception as exc:  # B5: one clause failure must not stub the whole scenario
             flags.append(f"[{spec.clause}] evaluate_failed: {type(exc).__name__}: {exc}")
@@ -1453,6 +1541,7 @@ def _evaluate_and_flip(
     engine_diff_counter: list | None = None,
     relevance: dict[str, bool] | None = None,
     mechanism_txn_ids: list[str] | None = None,
+    rp_overlap_fallback: list[RelatedParty] | None = None,
 ) -> tuple[dict, list[str], dict]:
     """Enum path is submission default; tree/shadow compare via expression engine.
 
@@ -1467,6 +1556,21 @@ def _evaluate_and_flip(
     engine = engine if engine in {"enum", "tree", "shadow"} else "shadow"
     relevance = relevance or {}
     mechanism_txn_ids = list(mechanism_txn_ids or doc_named_txn_ids or [])
+    rp_overlap_fallback = list(rp_overlap_fallback or [])
+
+    kyc_parties = list(kyc_facts.counterparties) if kyc_facts else []
+    rp_parties = list(kyc_parties)
+    if rp_overlap_fallback:
+        known = {p.counterparty_name.casefold().strip() for p in rp_parties}
+        for party in rp_overlap_fallback:
+            if party.counterparty_name.casefold().strip() not in known:
+                rp_parties.append(party)
+    rp_thr_pct = kyc_facts.related_party_threshold_pct if kyc_facts else None
+    rp_using_fallback = bool(rp_overlap_fallback) and (
+        not kyc_parties or len(rp_parties) > len(kyc_parties)
+    )
+    if rp_using_fallback and spec.covenant_type == "sum_related_party_payments":
+        flags.append("related_party_overlap_unconfirmed_fallback")
 
     # V4 §4: RP quote must evaluate via KYC mechanism — re-refine before taxonomy gate.
     qlow_pre = f"{spec.quote or ''} {spec.formula_description or ''}".casefold()
@@ -1559,8 +1663,8 @@ def _evaluate_and_flip(
         )
     expr_ctx = ExprContext(
         group_capex=group_capex_value,
-        related_parties=kyc_facts.counterparties if kyc_facts else None,
-        related_threshold_pct=kyc_facts.related_party_threshold_pct if kyc_facts else None,
+        related_parties=rp_parties or None,
+        related_threshold_pct=rp_thr_pct,
         off_ledger=off_ledger,
         period_end=spec.period_end,
         materiality_threshold_usd=materiality,
@@ -1583,6 +1687,15 @@ def _evaluate_and_flip(
             if ebitda <= 0:
                 return abs(float(fin_raw))  # undefined → treat as high leverage
             return abs(float(fin_raw)) / abs(float(ebitda))
+        if mode == "payroll_ratio_above":
+            from agent.s4_engine import _sum_cats
+
+            rev_raw, _ = _sum_cats(frame, cats, ["revenue"])
+            pay_raw, _ = _sum_cats(frame, cats, ["payroll"])
+            rev = abs(float(rev_raw))
+            if rev <= 0:
+                return 1.0  # undefined → treat as triggered
+            return abs(float(pay_raw)) / rev
         if mode == "min_quarter_revenue_below":
             def _rev_metric(qdf):
                 from agent.s4_engine import _sum_cats
@@ -1739,18 +1852,20 @@ def _evaluate_and_flip(
 
             return res, None, recompute
         if spec.covenant_type == "sum_related_party_payments":
-            if kyc_facts is None:
+            if not rp_parties:
                 return None, "related-party covenant missing KYC dossier; stubbed", None
             # threshold_pct may be None — dossier-labelled affiliates still evaluate.
             res = evaluate_sum_related_party_payments(
-                spec, frame, kyc_facts.counterparties, kyc_facts.related_party_threshold_pct, categories
+                spec, frame, rp_parties, rp_thr_pct, categories
             )
+            if rp_using_fallback:
+                res.flags = list(res.flags) + ["related_party_overlap_unconfirmed_fallback"]
 
             def recompute(subset, cats):
                 return apply_springing(
                     spec,
                     evaluate_sum_related_party_payments(
-                        spec, subset, kyc_facts.counterparties, kyc_facts.related_party_threshold_pct, cats
+                        spec, subset, rp_parties, rp_thr_pct, cats
                     ),
                     trigger_value=_springing_trigger(subset, cats),
                 ).status
@@ -1895,6 +2010,79 @@ def _evaluate_and_flip(
 
                 return res, None, recompute
 
+            # Asymmetric quarter reduce: max/min of quarter numerator over full-period denominator.
+            # Naive _with_quarters would give q/q = 1.0 when num_cats == den_cats.
+            if qred and "ebitda" not in f"{spec.quote or ''} {spec.formula_description or ''}".casefold():
+                from agent.s4_engine import CovenantResult, verdict as _verdict, _sum_cats, _cat_list
+
+                num_cats = _cat_list(spec.numerator_categories, spec.numerator_category, default=None)
+                den_cats = _cat_list(spec.denominator_categories, spec.denominator_category, default=None)
+                # Only when the clause is «max/min quarter of X as share of period X»
+                # (same categories). Capex/revenue springing must stay period/period.
+                if num_cats and den_cats and set(num_cats) == set(den_cats):
+
+                    def _num_metric(qdf):
+                        raw, ids = _sum_cats(qdf, categories, num_cats)
+                        return abs(float(raw)), ids, []
+
+                    num_val, num_ids, qflags = reduce_over_calendar_quarters(
+                        frame, spec.period_start, spec.period_end, qred, _num_metric
+                    )
+                    den_raw, den_ids = _sum_cats(frame, categories, den_cats)
+                    den_val = abs(float(den_raw))
+                    if den_val <= 0:
+                        ratio = max(abs(float(num_val)), 0.01)
+                        status = "BREACH" if spec.comparator == "max" else "COMPLIANT"
+                    else:
+                        ratio = abs(float(num_val)) / den_val
+                        status = _verdict(ratio, spec.comparator, spec.threshold)
+                    res = CovenantResult(
+                        clause=spec.clause,
+                        status=status,
+                        actual=round(abs(ratio), 2) if abs(ratio) > 0 else 0.01,
+                        contributing_txn_ids=list(dict.fromkeys(num_ids + den_ids)),
+                        flags=[f"asymmetric_quarter_reduce={qred}"] + qflags,
+                        inputs={
+                            "numerator": abs(float(num_val)),
+                            "denominator": den_val,
+                            "ratio_raw": float(ratio),
+                            "total": abs(float(num_val)),
+                            "numerator_categories": num_cats,
+                            "denominator_categories": den_cats,
+                        },
+                    )
+
+                    def recompute(subset, cats):
+                        def _m(qdf):
+                            raw, ids = _sum_cats(qdf, cats, num_cats)
+                            return abs(float(raw)), ids, []
+
+                        nv, _i, _f = reduce_over_calendar_quarters(
+                            subset, spec.period_start, spec.period_end, qred, _m
+                        )
+                        dr, _ = _sum_cats(subset, cats, den_cats)
+                        dv = abs(float(dr))
+                        if dv <= 0:
+                            r = max(abs(float(nv)), 0.01)
+                            st = "BREACH" if spec.comparator == "max" else "COMPLIANT"
+                        else:
+                            r = abs(float(nv)) / dv
+                            st = _verdict(r, spec.comparator, spec.threshold)
+                        return apply_springing(
+                            spec,
+                            CovenantResult(
+                                clause=spec.clause,
+                                status=st,
+                                actual=abs(r),
+                                contributing_txn_ids=[],
+                                flags=[],
+                                inputs={"value_raw": r, "numerator": abs(float(nv)), "denominator": dv},
+                            ),
+                            trigger_value=_springing_trigger(subset, cats),
+                        ).status
+
+                    return res, None, recompute
+
             res = _rg(frame)
 
             def recompute(subset, cats):
@@ -2020,6 +2208,108 @@ def _evaluate_and_flip(
                 flags.append("ENGINE_DIFF=0")
 
     flags.extend(result.flags)
+
+    # Prefer enum when tree silently zeroed related-party outflows without KYC names.
+    if (
+        spec.covenant_type == "sum_related_party_payments"
+        and any("related_outflows missing KYC" in str(f) for f in result.flags)
+    ):
+        if rp_parties:
+            enum_rp = evaluate_sum_related_party_payments(
+                spec, period_df, rp_parties, rp_thr_pct, categories
+            )
+            if rp_using_fallback:
+                enum_rp.flags = list(enum_rp.flags) + ["related_party_overlap_unconfirmed_fallback"]
+            enum_rp = apply_springing(
+                spec, enum_rp, trigger_value=_springing_trigger(period_df, categories)
+            )
+
+            def _rp_recompute(subset, cats):
+                return apply_springing(
+                    spec,
+                    evaluate_sum_related_party_payments(
+                        spec, subset, rp_parties, rp_thr_pct, cats
+                    ),
+                    trigger_value=_springing_trigger(subset, cats),
+                ).status
+
+            result, recompute = enum_rp, _rp_recompute
+            flags.append("related_party_tree_missing_kyc_forced_enum")
+        else:
+            stub_rp = _stub_cell(spec)
+            flags.append("related_party_tree_missing_kyc_stubbed")
+            return (
+                stub_rp,
+                flags,
+                build_cell_trace(
+                    stub_rp,
+                    spec=spec,
+                    stub_reason="related-party covenant missing KYC dossier; stubbed",
+                    clause_flags=flags,
+                ),
+            )
+
+    # Scale mismatch: money threshold vs ratio-scale actual → rescue as category sum.
+    if abs(float(spec.threshold)) >= 1000.0 and is_scale_mismatch(
+        float(spec.threshold), float(result.actual)
+    ):
+        q_all = f"{spec.quote or ''} {spec.formula_description or ''}"
+        rescued_spec = refine_covenant_spec(spec)
+        if not (
+            rescued_spec.covenant_type == "sum_category"
+            and (rescued_spec.filter_categories or rescued_spec.filter_category)
+        ):
+            filt = infer_money_metric_filter_categories(q_all)
+            lev = scrape_leverage_springing_threshold(q_all)
+            updates: dict = {
+                "covenant_type": "sum_category",
+                "filter_categories": filt,
+                "filter_category": filt[0] if filt else "capex",
+                "numerator_categories": [],
+                "denominator_categories": [],
+                "numerator_category": None,
+                "denominator_category": None,
+            }
+            if lev is not None:
+                updates["springing_mode"] = "leverage_above"
+                updates["springing_min_numerator"] = lev
+            rescued_spec = spec.model_copy(update=updates)
+        money_res = evaluate_sum_category(
+            rescued_spec,
+            period_df,
+            categories,
+            off_ledger=off_ledger,
+            materiality_threshold_usd=materiality,
+        )
+        money_res = apply_springing(
+            rescued_spec,
+            money_res,
+            trigger_value=_springing_trigger(period_df, categories),
+        )
+        money_res.flags = list(money_res.flags) + ["scale_mismatch_rescued"]
+
+        def _money_recompute(subset, cats, _spec=rescued_spec):
+            r = evaluate_sum_category(
+                _spec,
+                subset,
+                cats,
+                off_ledger=off_ledger,
+                materiality_threshold_usd=materiality,
+            )
+            return apply_springing(
+                _spec, r, trigger_value=_springing_trigger(subset, cats)
+            ).status
+
+        # Only accept rescue when it actually moves onto the threshold's scale.
+        if not is_scale_mismatch(float(rescued_spec.threshold), float(money_res.actual)):
+            result, recompute = money_res, _money_recompute
+            spec = rescued_spec
+            flags.append("scale_mismatch_rescued")
+    elif is_scale_mismatch(float(spec.threshold), float(result.actual)):
+        flags.append(
+            f"scale_mismatch_flag thr={spec.threshold} actual={result.actual}"
+        )
+
     hit_disagree = sorted(set(result.contributing_txn_ids) & categorize_disagree)
     if hit_disagree:
         flags.append(

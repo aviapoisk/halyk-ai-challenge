@@ -466,6 +466,46 @@ class TestPctOfGroupCapex:
         assert res.status == "COMPLIANT"
         assert res.actual == pytest.approx(1_541_027.11)
 
+    def test_pct_of_group_accepts_fraction_threshold(self):
+        """LLM may emit 0.05 instead of 5.0 — must not divide by 100 again."""
+        df = pd.DataFrame(
+            [
+                {
+                    "txn_id": "i1",
+                    "date": "2025-03-01",
+                    "account_id": "A",
+                    "counterparty": "C",
+                    "description": "interest",
+                    "amount": -1_128_378.65,
+                    "currency": "USD",
+                },
+                {
+                    "txn_id": "r1",
+                    "date": "2025-03-01",
+                    "account_id": "A",
+                    "counterparty": "C",
+                    "description": "rent",
+                    "amount": -412_648.46,
+                    "currency": "USD",
+                },
+            ]
+        )
+        cats = {"i1": "interest_expense", "r1": "rent"}
+        spec = _spec(
+            covenant_type="sum_category",
+            comparator="max",
+            threshold=0.05,
+            filter_categories=["interest_expense", "rent"],
+            quote="расходы не должны превышать 5% капитальных затрат Группы",
+            pct_of_group_capex=True,
+        )
+        res = evaluate_sum_categories_vs_group_pct(spec, df, cats, group_capex=32_053_535.58)
+        assert res.status == "COMPLIANT"
+        assert res.actual == pytest.approx(1_541_027.11)
+        assert any("limit=1602676" in f or "limit=1602676.77" in f for f in res.flags) or any(
+            "1602676" in f for f in res.flags
+        )
+
     def test_refine_sets_pct_flag(self):
         spec = _spec(
             covenant_type="unknown",

@@ -75,6 +75,29 @@ def write_submission_atomic(
     return result, fixes
 
 
+def triage_duplicate_actuals(submission: dict, template: dict) -> list[str]:
+    """Flag identical actual values shared by ≥2 clauses within one scenario."""
+    flags: list[str] = []
+    answers = submission.get("answers") or {}
+    for sid, clauses in (template.get("answers") or {}).items():
+        cells = answers.get(sid) or {}
+        by_actual: dict[float, list[str]] = {}
+        for clause in clauses:
+            cell = cells.get(clause) if isinstance(cells.get(clause), dict) else None
+            if not isinstance(cell, dict):
+                continue
+            try:
+                actual = round(abs(float(cell.get("actual"))), 2)
+            except (TypeError, ValueError):
+                continue
+            by_actual.setdefault(actual, []).append(str(clause))
+        for actual, clause_list in sorted(by_actual.items(), key=lambda kv: kv[0]):
+            if len(clause_list) >= 2:
+                joined = ",".join(sorted(clause_list))
+                flags.append(f"{sid}: duplicate_actual {actual} on {joined}")
+    return flags
+
+
 def triage_actual_vs_threshold(submission: dict, template: dict) -> list[str]:
     """C2 fallback: flag incomplete cells when threshold traces are unavailable."""
     flags: list[str] = []
@@ -103,11 +126,17 @@ def write_confidence_report(report: dict, out_dir: Path) -> None:
     case_traces = report.get("case_traces") or {}
     thr_flags = _triage_from_case_traces(case_traces)
     fallback: list[str] = []
+    dup_flags: list[str] = []
     if isinstance(sub, dict) and isinstance(tmpl, dict):
         fallback = triage_actual_vs_threshold(sub, tmpl)
-    combined = list(dict.fromkeys([*thr_flags, *fallback]))
+        dup_flags = triage_duplicate_actuals(sub, tmpl)
+    combined = list(dict.fromkeys([*thr_flags, *fallback, *dup_flags]))
     if len(combined) > 20:
-        preferred = [f for f in combined if any(k in f for k in ("extreme", "near_threshold", "incomplete"))]
+        preferred = [
+            f
+            for f in combined
+            if any(k in f for k in ("extreme", "near_threshold", "incomplete", "duplicate_actual"))
+        ]
         combined = preferred[:20]
         if len(preferred) > 20:
             combined.append("triage_truncated")

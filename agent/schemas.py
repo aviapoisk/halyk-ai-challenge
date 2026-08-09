@@ -161,7 +161,7 @@ class CovenantSpec(BaseModel):
     expr_nodes: SkipJsonSchema[list[ExprNode] | None] = None
     expr_root: SkipJsonSchema[int | None] = None
     # Python-only refine markers (never in LLM schema).
-    # springing_mode: numerator_above | own_capex_above | min_quarter_revenue_below | leverage_above
+    # springing_mode: numerator_above | own_capex_above | min_quarter_revenue_below | leverage_above | payroll_ratio_above
     springing_mode: SkipJsonSchema[str | None] = None
     # description_bucket: marketing | consulting — sum by description needles, not CategoryName.
     description_bucket: SkipJsonSchema[str | None] = None
