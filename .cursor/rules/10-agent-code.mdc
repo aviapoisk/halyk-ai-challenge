@@ -1,0 +1,63 @@
+---
+description: Binding engineering rules for the covenant-checking agent pipeline code
+alwaysApply: true
+---
+
+# Agent code rules
+
+## Architecture (accepted — do not redesign)
+
+Six stages, one CLI, no orchestration frameworks:
+S1 ingestion (PyMuPDF; per-page "too few chars → vision" fallback) → S2 doc classification & borrower binding → S3 case compilation (LLM → typed facts with citations) → S4 deterministic engine (all math in pandas) → S5 evidence flip-test → S6 confidence report + submission validator.
+
+Concurrency: `asyncio.gather` + semaphore (`AGENT_LLM_CONCURRENCY` / `--profile`). No PriorityQueue / event-driven / streaming redesigns — rejected as overengineering for ~200 small PDFs.
+
+## The one principle
+
+**LLM extracts meaning with citations; Python makes every decision and computes every number.** The LLM never sees the full ledger, never does arithmetic, never outputs a verdict. All filtering, FX conversion, auditor reclassifications, aggregation, and threshold comparison happen in deterministic pandas/Python.
+
+## CLI contract (tests and README depend on it)
+
+```
+python -m agent.run --dataset <DIR> --out <FILE.json> [--profile default] [--cache .cache/] [--seed 42]
+```
+
+- `<DIR>` = any folder with `master_ledger_*.csv`, `documents/`, `submission_template.json`
+- one process, no interactive input; on mid-run API failure still write a valid, fully-filled submission with flags in the confidence report (a crash without a file is the worst outcome)
+- diagnostics (`trace.json`, `confidence_report.json`, `config.json`, `agent.log`) go to `logs/` (CWD) or `<out.parent>/logs/` when `--out` is not in CWD
+
+## Determinism (organizers' rerun must reproduce bytes)
+
+- Anthropic path omits temperature (API constraint); OpenAI-compatible sets temperature 0; strict Pydantic schemas; ALL LLM calls go through one cached client wrapper (cache key = SHA-256 of model + prompt + content + schema) — no scattered SDK calls
+- no timestamps inside outputs, no unseeded randomness; sort everything that reaches the output file
+- local `.cache/` is gitignored; `data/cache/` is allowed by `.gitignore` but not shipped; `--no-cache` = live run
+- write `submission.json` atomically (tmp → rename) after sanitize; always write even if validator reports violations
+
+## No hardcoding
+
+- scenario ids and clause numbers only from `submission_template.json` (`answers` keys); `account_id ↔ scenario_id` only from the ledger `txn_id` prefix at runtime; covenant parameters only from documents; counts of borrowers/documents/clauses are variables
+- open-set literals (`P5`, `ACC-7805`, `f3fa6d20c8a1.pdf`, thresholds, FX rates) are allowed in `tests/` fixtures only — never in agent code
+- model names in env/config only
+
+## Extraction & binding
+
+- extraction is per-document; the borrower case is assembled in Python from per-document JSON (context bounded by one document, not one case); a whole-case "wide" profile may exist behind a flag, never as default
+- regex/anchor matching only on normalized text (collapse letter-spacing, NBSP, quote variants); citations come from the original un-normalized text
+- entity binding: exact match on the normalized full legal name + `ACC-\d{4}` anchors; fuzzy matching may only suggest candidates in reports — the corpus has near-duplicate names of different companies (`Shymkent Refinery Services JSC` vs `Shymkent Refinery JSC`)
+- contract validity = validity dates in the text covering the covenant period; the «НЕДЕЙСТВУЮЩАЯ РЕДАКЦИЯ» stamp is a secondary signal only (organizer-confirmed)
+- ambiguous ledger rows: batched, cached LLM labeling — never per-row calls in a loop
+- open-set corpus is small enough (~780k input tokens total) that per-document full-text extraction beats RAG
+
+## Numbers & evidence
+
+- full precision internally; round to 2 decimals only at output; `actual` = abs(value) as a plain number (`9.45`, not `"9.45x"`)
+- never average competing `actual` hypotheses — the scoring decay is linear, so pick the better-documented reading
+- FX rates only from the borrower's own documents; a missing rate = loud flag, never a guess or an external lookup
+- evidence via the engine flip-test: exactly one verdict-flipping transaction → its id, zero or several → `null`; document-named candidates are a second vote, conflicts get flagged
+- FORBIDDEN: a "BREACH ⇒ evidence required" validator (false on 8 open-GT cells); "COMPLIANT ⇒ null" is a soft warning only, never an auto-fix
+
+## Prohibitions
+
+- no manual editing of answers/`submission.json`; no HITL/override code reachable from `agent.run` (dev-only triage tools live outside the battle path)
+- do not build or resurrect: MCC/BIN/МРП logic, prebuilt KZT support, an OCR subsystem, orchestration frameworks, TUI verdict overrides (OpenAI-compatible local server in `agent/llm.py` is dev-only, not battle default)
+- dependency budget: `pymupdf`, `pandas`, `pydantic`, provider SDK, `tenacity`, `pytest` (+ `textual` only for `tools/dev.py`) — anything beyond needs a one-line justification in the commit message

@@ -1,0 +1,114 @@
+# --- secrets / local env ---
+.env
+.env.*
+!.env.example
+!env.example
+*.pem
+*.key
+credentials*.json
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/pytest/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.dmypy.json
+dmypy.json
+.pytype/
+.ipynb_checkpoints/
+*.ipynb
+
+# --- virtualenvs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- runtime / pipeline outputs ---
+# Local parse + LLM sidecar cache (commit a curated subset under data/cache/ if needed for reproducibility)
+#.cache/
+#!data/cache/
+#!data/cache/**
+
+# Submissions & triage reports (template stays tracked)
+submission.json
+**/submission.json
+!**/submission_template.json
+confidence_report*.json
+confidence_report*.md
+overrides.yaml
+*.override.yaml
+
+# Private battle-day dataset drop (open sample is under data/agentic-bank-public/)
+private/
+data/private/
+data/agentic-bank-private/
+docs/agentic-bank-private/
+
+# --- tooling / generated ---
+graphify-out/
+**/graphify-out/
+refs/ChatExport_*/
+*.log
+logs/*
+tmp/
+temp/
+.tmp/
+out/
+output/
+runs/
+
+# --- OS / editors ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+.idea/
+*.swp
+*.swo
+*~
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# --- misc ---
+*.bak
+*.orig
+.direnv/
+.mise.toml.local
+trace.json

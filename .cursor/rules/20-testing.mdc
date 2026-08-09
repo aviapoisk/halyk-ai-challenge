@@ -1,0 +1,33 @@
+---
+description: Testing harness rules — validator, scorer, holdout, definition of done for changes
+globs: tests/**,tools/**
+alwaysApply: false
+---
+
+# Testing rules
+
+## Harness layers
+
+- `tools/validate.py` — contract validator, works without GT; the **only** check available on battle day. Checks: top-level keys exactly `team`/`contact_email`/`model`/`answers`; scenario/clause set matches `submission_template.json` character-for-character; `status` ∈ {"COMPLIANT","BREACH"}; `actual` a finite number > 0 with exactly two decimal places; `evidence_txn_id` `null` or an existing ledger id belonging to the same scenario; zero empty cells. Zero violations = exit 0 (warnings like COMPLIANT+non-null evidence do not block).
+- `tools/score.py` — official formula: `status` 0.50 gate (wrong → cell = 0), `actual` 0.30 with linear decay `max(0, 1 − e/0.05)`, `evidence` 0.20. When GT evidence is `null`, run BOTH `lenient` and `strict` modes and watch the gap — a gap > ~0.01 total means the solution guesses txn_ids where unsure (risk on unconfirmed semantics). GT and submission have different shapes (`scenarios.<id>.covenants.<clause>` vs `answers.<id>.<clause>`) — normalize both before comparing.
+- `tools/dev.py` — read-only triage browser for `logs/dev_dump.json`; never imported from `agent.run`; never used to edit answers.
+- `tests/` — fast, no LLM, run on every commit: normalization (letter-spacing, NBSP, legal names / near-duplicates), scorer edges, flip-test on a toy ledger, S4 arithmetic (FX, reclass, formula families), S6 sanitize/atomic write, recovery that still writes a full `submission.json`, dataset discovery by directory shape.
+
+There is no `tools/mutate.py` in this tree. Do not claim mutation-suite coverage; prefer document-justified fixes over score-chasing on a single borrower.
+
+## Definition of done for any change
+
+1. Unit tests green (`uv run pytest -q`).
+2. Full open-set run + `tools/score.py` vs GT, per-cell diff reviewed.
+3. Every GT divergence diagnosed (symptom / diagnosis / fix); a fix must be justified by document text — "raises the score but only affects P6" without a document basis is a revert candidate.
+4. Frozen holdout **P4 / P7 / B4**: never tune against them, check them roughly daily.
+
+## Determinism & rerun tests
+
+- two consecutive warm-cache runs → empty `diff` on `submission.json` (except intentional `use_cache=False` repair / self-consistency paths)
+- clean clone + `.env.example` must run end-to-end (organizers will do exactly this)
+- simulated API cutoff after N calls → valid, fully-filled partial submission, not a stack trace
+
+## Baseline sanity
+
+The constant baseline "all COMPLIANT, actual random" scores ≈ 0.26 on the open GT (19/36 × 0.5). Any run below that means the pipeline is worse than a constant — treat as a red alert, not a tuning opportunity.

@@ -1,0 +1,26 @@
+---
+description: Halyk AI Challenge — project context, scoring model, deadlines, source-of-truth docs
+alwaysApply: true
+---
+
+# Halyk AI Challenge — context (read first)
+
+We are building a hackathon agent: it reads unstructured corporate-loan PDFs plus a shared transaction ledger and, for every `(scenario_id, covenant clause)` pair, outputs `status` (COMPLIANT/BREACH), `actual` (metric value), and `evidence_txn_id` (the single verdict-flipping transaction, or `null`) into `submission.json` matching `submission_template.json` byte-exactly by keys.
+
+Hard facts that drive every decision:
+
+- Battle window: private dataset drops 2026-08-09 11:00 (Astana), submission closes 14:00 — 3 hours. Everything must be built and rehearsed on the open set before that; on battle day we only flip config flags.
+- Scoring per cell: `status` 0.50 (wrong status zeroes the whole cell), `actual` 0.30 (linear decay, zero at 5% relative error), `evidence_txn_id` 0.20 (when GT evidence is `null`, these 0.20 decay together with `actual` — number accuracy is then effectively worth 0.50). Cells are weighted by unpublished difficulty. An empty cell scores like a wrong one — always fill everything.
+- Organizers rerun the solution with their own API keys and must get identical answers; top teams' code is reviewed by hand, so README and code readability are scoring factors.
+- Manual/human-edited answers = disqualification. AI-assisted *coding* is allowed; the shipped agent must generate every answer itself.
+
+Source of truth in this tree (newer / more specific wins on conflict):
+
+1. `data/agentic-bank-public/CASE.ru.md` / `CASE.kz.md` — official task spec
+2. `CLAUDE.md` + `.cursor/rules/10-agent-code.mdc` — accepted architecture (S1–S6) and binding engineering rules
+3. `README.md` — CLI, cache/rerun story, repo layout for organizers
+4. Open-set facts baked into the rules below (token budget ≈780k, date-based contract validity, ACC/letter-spacing traps) — there is no separate `docs/` planning corpus in this tree
+
+`data/agentic-bank-public/ground_truth.json` is a dev oracle for the open set only (`scenarios.*.covenants` shape). The private set will have different scenario ids, different counts of borrowers/documents/clauses, and possibly covenant types not seen in the open set.
+
+Do not invent paths to missing `docs/*` or `refs/*`. Do not resurrect HITL/override tooling on the battle path.
