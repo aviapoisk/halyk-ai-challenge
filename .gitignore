@@ -65,8 +65,8 @@ env/
 #!data/cache/**
 
 # Submissions & triage reports (template stays tracked)
-submission.json
-**/submission.json
+# submission.json
+# **/submission.json
 !**/submission_template.json
 confidence_report*.json
 confidence_report*.md
